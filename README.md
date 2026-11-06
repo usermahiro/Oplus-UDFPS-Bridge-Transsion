@@ -338,3 +338,33 @@ Confirm that the SystemUI animation window has valid dimensions (`500x500` rathe
 adb shell "dumpsys window windows | grep -A 10 'OnScreenFingerprintPressedIcon'"
 ```
 The output should report `Requested w=500 h=500`.
+
+---
+
+## 10. Goodix `gf_fingerprint.default.so` support (crash fix)
+
+The Transsion Goodix HAL (`/odm/lib64/hw/gf_fingerprint.default.so`) does **not** use the AOSP
+`fingerprint_device_t` table. Calling it with the AOSP offsets made `createSession` invoke the
+HAL's `remove(dev, ids*, count)` with `ids = NULL` (SIGSEGV, fault addr 0, `gf_fingerprint.default.so+0x19940`).
+
+`hal.rs` now detects the layout at load time (`_Z17fingerprintNotifyPK18gf_fingerprint_msg` exported => Goodix) and uses:
+
+| Offset | Goodix slot |
+|---|---|
+| 0x80 | set_notify |
+| 0x88 | generateChallenge (result via notify msg 7) |
+| 0x90 | revokeChallenge(dev, challenge) (msg 8) |
+| 0x98 | enroll |
+| 0xa0 | getAuthenticatorId (msg 9) |
+| 0xa8 | invalidateAuthenticatorId (msg 10) |
+| 0xb0 | cancel |
+| 0xb8 | enumerate (msg 6: u32 id list) |
+| 0xc0 | remove(dev, ids*, count<=5) (msg 4: u32 id list) |
+| 0xc8 | set_active_group |
+| 0xd0 | authenticate |
+| 0x110 | command(dev, cmd, arg): 0x0a updateUiReadyStatus, 0x0b updateUiReady |
+
+Silead-specific symbol resolution (`libsl_fp_impl.so`, `silfp_*`) is skipped on the Goodix layout.
+`set_active_group` is now logged before and after the call to make any future crash easy to locate.
+
+Not verified statically: the payload of ENROLLING (msg 3) on this HAL; check `Enroll progress` logs when enrolling.

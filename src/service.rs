@@ -106,7 +106,7 @@ impl ISession for SessionService {
         let hal = self.hal.clone();
         std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(5));
-            hal.post_enroll();
+            hal.post_enroll(challenge as u64);
             log_info!("Dispatching onChallengeRevoked(0x{:x}) asynchronously", challenge);
             if let Err(e) = cb.onChallengeRevoked(challenge) {
                 log_error!("cb.onChallengeRevoked failed: {e}");
@@ -158,9 +158,8 @@ impl ISession for SessionService {
         let cb = self.cb.clone();
         let hal = self.hal.clone();
         std::thread::spawn(move || {
-            for &id in &ids {
-                hal.remove(id as u32);
-            }
+            let raw_ids: Vec<u32> = ids.iter().map(|&id| id as u32).collect();
+            hal.remove_many(&raw_ids);
             // Allow up to 150ms for asynchronous notification from vendor HAL
             std::thread::sleep(std::time::Duration::from_millis(150));
             if hal.check_and_clear_remove_pending() {
@@ -194,7 +193,7 @@ impl ISession for SessionService {
         let cb = self.cb.clone();
         std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(5));
-            let new_auth_id = hal.get_authenticator_id();
+            let new_auth_id = hal.invalidate_authenticator_id();
             log_info!("Dispatching onAuthenticatorIdInvalidated(0x{:x}) asynchronously", new_auth_id);
             if let Err(e) = cb.onAuthenticatorIdInvalidated(new_auth_id as i64) {
                 log_error!("cb.onAuthenticatorIdInvalidated failed: {e}");
@@ -326,8 +325,8 @@ impl IFingerprint for FingerprintService {
             r#sensorType: FingerprintSensorType::UNDER_DISPLAY_OPTICAL,
             r#sensorLocations: vec![SensorLocation {
                 r#displayId: 0,
-                r#sensorLocationX: 540,
-                r#sensorLocationY: 2172,
+                r#sensorLocationX: 550,
+                r#sensorLocationY: 2171,
                 r#sensorRadius: 114,
                 r#display: "".to_string(),
                 r#sensorShape: SensorShape::CIRCLE,

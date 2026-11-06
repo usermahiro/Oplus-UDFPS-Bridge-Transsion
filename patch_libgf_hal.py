@@ -46,6 +46,7 @@ def patch_libgf_hal(filepath):
 
     print(f"Successfully patched: {outpath}")
 
+
 if __name__ == "__main__":
     if len(sys.argv) < 2:
         print("Usage: python3 patch_libgf_hal.py <path_to_libgf_hal.so>")

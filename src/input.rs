@@ -18,10 +18,16 @@ pub const ABS_MT_POSITION_X: u16 = 0x35;
 pub const ABS_MT_POSITION_Y: u16 = 0x36;
 pub const ABS_MT_TRACKING_ID: u16 = 0x39;
 
-// Calibrated Optical FOD Sensor Location & Touch Target for Transsion Camon 30 Pro (1080x2436)
-// Hardware property persist.vendor.fingerprint.optical.sensorlocation: [540::2172], diameter: 228 (radius: 114)
-pub const FOD_CENTER_X: i32 = 540;
-pub const FOD_CENTER_Y: i32 = 2172;
+// Goodix MTK touchscreen scaling factor for Infinix GT 20 Pro (x6860-g3t)
+// Raw touch coordinates from mtk-tpd (max ~17279, 38399) scale by 1/16 to panel logical coords
+pub const TOUCH_SCALE_FACTOR: i32 = 16;
+pub const TOUCH_MAX_X: i32 = 17279;
+pub const TOUCH_MAX_Y: i32 = 38399;
+
+// Calibrated Optical FOD Sensor Location & Touch Target for Infinix GT 20 Pro (x6860-g3t, MT6789)
+// Hardware property persist.vendor.fingerprint.optical.sensorlocation: [550::2171], diameter: 228 (radius: 114)
+pub const FOD_CENTER_X: i32 = 550;
+pub const FOD_CENTER_Y: i32 = 2171;
 pub const FOD_TOUCH_RADIUS: i32 = 140; // 114px sensor radius + 26px thumb margin
 pub const FOD_TOUCH_RADIUS_SQ: i32 = FOD_TOUCH_RADIUS * FOD_TOUCH_RADIUS; // 19600
 
@@ -220,61 +226,10 @@ pub fn find_power_key_device() -> Option<(File, String)> {
 }
 
 pub fn wake_display_pipeline() {
-    let mut last_wake = LAST_WAKE_TIME.lock();
-    if let Some(t) = *last_wake {
-        if t.elapsed() < std::time::Duration::from_millis(600) {
-            log_info!("wake_display_pipeline: debounced (<600ms)");
-            return;
-        }
-    }
-    *last_wake = Some(std::time::Instant::now());
-
-    let (dev_file, path) = match find_power_key_device() {
-        Some(pair) => pair,
-        None => match OpenOptions::new().write(true).open("/dev/input/event0") {
-            Ok(f) => (f, "/dev/input/event0".to_string()),
-            Err(e) => {
-                log_warn!("wake_display_pipeline: failed to open power key device: {e}");
-                return;
-            }
-        },
-    };
-
-    use std::io::Write;
-    let mut dev = dev_file;
-    let ev_down = InputEvent {
-        time: libc::timeval { tv_sec: 0, tv_usec: 0 },
-        type_: EV_KEY,
-        code: 116, // KEY_POWER
-        value: 1,
-    };
-    let ev_syn = InputEvent {
-        time: libc::timeval { tv_sec: 0, tv_usec: 0 },
-        type_: EV_SYN,
-        code: 0,
-        value: 0,
-    };
-    let ev_up = InputEvent {
-        time: libc::timeval { tv_sec: 0, tv_usec: 0 },
-        type_: EV_KEY,
-        code: 116, // KEY_POWER
-        value: 0,
-    };
-
-    let sz = std::mem::size_of::<InputEvent>();
-    unsafe {
-        let p_down = std::slice::from_raw_parts(&ev_down as *const _ as *const u8, sz);
-        let p_syn = std::slice::from_raw_parts(&ev_syn as *const _ as *const u8, sz);
-        let p_up = std::slice::from_raw_parts(&ev_up as *const _ as *const u8, sz);
-
-        let _ = dev.write_all(p_down);
-        let _ = dev.write_all(p_syn);
-        std::thread::sleep(std::time::Duration::from_millis(15));
-        let _ = dev.write_all(p_up);
-        let _ = dev.write_all(p_syn);
-    }
-
-    log_info!("wake_display_pipeline: injected KEY_POWER pulse via {} to exit doze/sleep", path);
+    // Goodix/ColorOS: Do NOT inject KEY_POWER (116) here.
+    // ColorOS theiaPwkReport detects KEY_POWER and cancels AOD auth with CANCELED_forAod / CANCELED_sleepLocked.
+    // Display wake is handled by Binder transact 1001 (cmd 1201) in notify_framework_touch().
+    log_info!("wake_display_pipeline: KEY_POWER injection suppressed for Goodix/ColorOS compatibility");
 }
 
 pub fn start_screen_off_touch_monitor(hal: Arc<crate::hal::FingerprintHal>) {

@@ -3,13 +3,13 @@ use std::io;
 use parking_lot::Mutex;
 use crate::{log_error, log_info, log_warn};
 
-const HBM_PRIMARY: &str = "/sys/devices/platform/soc/14013000.dsi/lcm_hbm_state";
+const HBM_PRIMARY: &str = "/sys/kernel/tran_display/lcm_hbm_state";
 const OPLUS_DISPLAY_DIR: &str = "/data/addon/oplus_display";
 const OPLUS_DISPLAY_HBM: &str = "/data/addon/oplus_display/hbm";
 
 const HBM_CANDIDATES: &[&str] = &[
+    "/sys/kernel/tran_display/lcm_hbm_state", // Transsion/Infinix primary
     "/sys/devices/platform/soc/14013000.dsi/lcm_hbm_state", // MT6789 / Helio G99 / Dimensity
-    "/sys/kernel/tran_display/lcm_hbm_state",
     "/sys/devices/platform/soc/14000000.dispsys_config/lcm_hbm_state",
     "/sys/class/drm/card0-DSI-1/hbm",
 ];
