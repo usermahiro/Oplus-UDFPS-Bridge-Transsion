@@ -44,7 +44,7 @@ case "$CMD" in
         ;;
     clean)
         log_info "Cleaning build artifacts..."
-        rm -rf "${OUT_DIR}" "${SCRIPT_DIR}/target" "${SCRIPT_DIR}/libsl_fp_impl.so.patched"
+        rm -rf "${OUT_DIR}" "${SCRIPT_DIR}/target"
         log_success "Clean completed."
         exit 0
         ;;
@@ -222,20 +222,7 @@ echo "# Disabled in favor of AIDL Fingerprint HAL" > "$OUT_DIR/vendor/etc/init/a
 echo "# Disabled in favor of AIDL Fingerprint HAL" > "$OUT_DIR/vendor/etc/init/android.hardware.biometrics.fingerprint@2.3-service.transsion.rc"
 chmod 0644 "$OUT_DIR/vendor/etc/init/"*.rc
 
-# 4. Optional: Generate pre-patched Silead HAL
-if [ -f "${SCRIPT_DIR}/libsl_fp_impl.so" ] && [ -f "${SCRIPT_DIR}/patch_libsl_fp.py" ]; then
-    log_info "Generating pre-patched libsl_fp_impl.so for Camon 30 Pro (KJ7)..."
-    python3 "${SCRIPT_DIR}/patch_libsl_fp.py" "${SCRIPT_DIR}/libsl_fp_impl.so"
-    if [ -f "${SCRIPT_DIR}/libsl_fp_impl.so.patched" ]; then
-        mkdir -p "$OUT_DIR/vendor/lib64"
-        cp -f "${SCRIPT_DIR}/libsl_fp_impl.so.patched" "$OUT_DIR/vendor/lib64/libsl_fp_impl.so"
-        chmod 0644 "$OUT_DIR/vendor/lib64/libsl_fp_impl.so"
-        rm -f "${SCRIPT_DIR}/libsl_fp_impl.so.patched"
-    fi
-fi
-
-# 5. Copy utility scripts to out
-cp -f "${SCRIPT_DIR}/patch_libsl_fp.py" "$OUT_DIR/" 2>/dev/null || true
+# 4. Copy utility scripts to out
 cp -f "${SCRIPT_DIR}/patch_libgf_hal.py" "$OUT_DIR/" 2>/dev/null || true
 
 # 6. Package archives
@@ -252,7 +239,7 @@ with zipfile.ZipFile("transsion-vendor-fod-package.zip", "w", zipfile.ZIP_DEFLAT
     for root, _, files in os.walk("vendor"):
         for f in files:
             z.write(os.path.join(root, f))
-    for f in ["patch_libsl_fp.py", "patch_libgf_hal.py"]:
+    for f in ["patch_libgf_hal.py"]:
         if os.path.exists(f):
             z.write(f)
 '

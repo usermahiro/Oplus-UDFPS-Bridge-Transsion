@@ -3,6 +3,10 @@ use std::io;
 use parking_lot::Mutex;
 use crate::{log_error, log_info, log_warn};
 
+/// Fixed settle delay after enabling HBM. lcm_hbm_state always reads back a constant (0xFA on X6886),
+/// so it cannot be used as an ack; we do not poll it.
+pub const HBM_SETTLE_MS: u64 = 50;
+
 const HBM_PRIMARY: &str = "/sys/kernel/tran_display/lcm_hbm_state";
 const OPLUS_DISPLAY_DIR: &str = "/data/addon/oplus_display";
 const OPLUS_DISPLAY_HBM: &str = "/data/addon/oplus_display/hbm";
@@ -92,42 +96,11 @@ impl HbmController {
             let _ = std::fs::create_dir_all(OPLUS_DISPLAY_DIR);
             let _ = std::fs::write(OPLUS_DISPLAY_HBM, b"1\n");
 
-            let effective_timeout_ms = max_wait_ms.max(500);
-            let start = std::time::Instant::now();
-            let timeout = std::time::Duration::from_millis(effective_timeout_ms);
-            let mut attempts = 0;
-
-            loop {
-                attempts += 1;
-                let _ = std::fs::write(path, b"1\n");
-
-                if let Ok(status) = std::fs::read_to_string(path) {
-                    if status.contains("0xOK") {
-                        self.is_enabled = true;
-                        log_info!(
-                            "Hardware LCM HBM confirmed active (0xOK) in {:?} (attempts={})",
-                            start.elapsed(),
-                            attempts
-                        );
-                        return true;
-                    }
-                }
-
-                if start.elapsed() >= timeout {
-                    log_warn!(
-                        "Hardware LCM HBM write timed out waiting for 0xOK after {:?} (attempts={})",
-                        start.elapsed(),
-                        attempts
-                    );
-                    break;
-                }
-
-                // Fast poll (3ms) for rapid HBM activation synchronized with ColorOS VSYNC frames
-                std::thread::sleep(std::time::Duration::from_millis(3));
-            }
-
+            let _ = max_wait_ms;
+            let _ = std::fs::write(path, b"1\n");
             self.is_enabled = true;
-            false
+            log_info!("Hardware LCM HBM enabled");
+            true
         } else {
             HBM_GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             self.is_enabled = false;
@@ -140,17 +113,24 @@ impl HbmController {
 }
 
 pub fn set_hbm(enabled: bool) -> bool {
-    set_hbm_sync(enabled, if enabled { 500 } else { 0 })
+    set_hbm_sync(enabled, if enabled { HBM_SETTLE_MS } else { 0 })
 }
 
-pub fn set_hbm_sync(enabled: bool, max_wait_ms: u64) -> bool {
-    let mut lock = GLOBAL_HBM.lock();
-    if lock.is_none() {
-        *lock = Some(HbmController::new());
+pub fn set_hbm_sync(enabled: bool, settle_ms: u64) -> bool {
+    // Hold the global lock only for the sysfs write, never while sleeping,
+    // so set_hbm(false) from the HAL callback thread is never blocked.
+    let ok = {
+        let mut lock = GLOBAL_HBM.lock();
+        if lock.is_none() {
+            *lock = Some(HbmController::new());
+        }
+        match lock.as_mut() {
+            Some(ctrl) => ctrl.write_hbm_sync(enabled, 0),
+            None => false,
+        }
+    };
+    if enabled && settle_ms > 0 {
+        std::thread::sleep(std::time::Duration::from_millis(settle_ms));
     }
-    if let Some(ctrl) = lock.as_mut() {
-        ctrl.write_hbm_sync(enabled, max_wait_ms)
-    } else {
-        false
-    }
+    ok
 }

@@ -13,7 +13,7 @@ The entire implementation operates inside the `/vendor` partition, without requi
 - **ColorOS Framework**: ColorOS 16 and 17 (Android 14+) require an AIDL HAL service (`android.hardware.biometrics.fingerprint.IFingerprint`). In addition, the ColorOS `OnScreenFingerprintUiMech` framework relies on vendor-specific Binder IPC transactions on `ISessionCallback` (transaction 1001 with command 1201 for `TouchDown` and command 1202 for `TouchUp`).
 
 ### MediaTek Kernel HBM Gating
-- Optical under-display fingerprint sensors (Silead GSL7001 / Goodix) require the AMOLED display area above the sensor to illuminate at High Brightness Mode (HBM) during optical acquisition.
+- Optical under-display fingerprint sensors (Goodix) require the AMOLED display area above the sensor to illuminate at High Brightness Mode (HBM) during optical acquisition.
 - In the MediaTek DRM display driver (`tran_lcm_hbm_set`), writing to the HBM control node is rejected if the display controller is in sleep or doze:
   ```c
   if (!crtc->enabled || !dsi->enabled || dsi->is_doze) {
@@ -35,8 +35,8 @@ The entire implementation operates inside the `/vendor` partition, without requi
   - Command 1010: Total enrollment steps.
   - Command 1011: Screen state synchronization.
   - Transaction 1001 (commands 1201/1202): Direct touch dispatch to ColorOS SystemUI.
-- **Dynamic C Vendor Loader**: Loads the patched stock vendor binary (`libsl_fp_impl.so`) via `dlopen`/`dlsym`. Dispatches commands across a dedicated worker pool and strips non-standard vendor acquired messages (1001, 1002, 1020) that would otherwise cause framework errors.
-- **Synchronous HBM Controller**: Writes to `/sys/devices/platform/soc/14013000.dsi/lcm_hbm_state` in a polling loop until the kernel confirms the state change with `0xOK`. Synchronized with SystemUI display power requests (`requestDisplayPower`).
+- **Dynamic C Vendor Loader**: Loads the stock Goodix HAL (`libgf_hal.so` / `gf_fingerprint.default.so`) via `dlopen`/`dlsym` and sends Goodix vendor commands through `fingerprint_command`. Strips non-standard vendor acquired messages (1001, 1002, 1020) that would otherwise cause framework errors.
+- **Fixed-settle HBM Controller**: Writes `1` to `/sys/kernel/tran_display/lcm_hbm_state` and waits a fixed 50 ms settle delay. The node reads back a constant value (e.g. `0xFA`), so it cannot be used as an acknowledgement.
 - **Context-Aware Wake Engine**: Inspects the DRM panel state via `/sys/class/drm/card0-DSI-1/dpms`:
   - When DPMS is `Off` (deep sleep): Injects `KEY_POWER` into `/dev/input/event0` (PMIC keys) to wake the hardware display pipeline.
   - When DPMS is `On` (screen active or AOD): Suppresses power key injection completely. Holds an in-kernel wake lock (`oplus_udfps_fod_wake`) and lets ColorOS SystemUI transition the panel power state without breaking the AOD Dream lifecycle.
@@ -69,8 +69,8 @@ flowchart TD
         FtsDriver["FocalTech Touch Driver<br/>(/dev/input/event4)"]
         PmicKeys["MediaTek PMIC Keys<br/>(/dev/input/event0)"]
         MtkDrm["MediaTek DRM Display<br/>(card0-DSI-1 / dpms)"]
-        HbmNode["AMOLED LCM HBM Node<br/>(14013000.dsi/lcm_hbm_state)"]
-        SileadDev["Silead Optical Sensor<br/>(/dev/silead_fp)"]
+        HbmNode["AMOLED LCM HBM Node<br/>(tran_display/lcm_hbm_state)"]
+        GoodixDev["Goodix Optical Sensor"]
     end
 
     FpService <-->|"Binder IPC: AIDL IFingerprint"| AidlService
@@ -80,9 +80,9 @@ flowchart TD
     PmicKeys -->|"Wake Event"| PowerMgr
     TouchMon -->|"Valid FOD Touch"| AidlService
     AidlService -->|"Sync Lock and Write"| HbmCtrl
-    HbmCtrl -->|"Write 1 and Check 0xOK"| HbmNode
+    HbmCtrl -->|"Write 1 (fixed 50ms settle)"| HbmNode
     AidlService -->|"Dispatch Command"| HalWrap
-    HalWrap <-->|"ioctl / SPI"| SileadDev
+    HalWrap <-->|"ioctl / SPI"| GoodixDev
     MtkDrm -.->|"Check DPMS Status"| TouchMon
 ```
 
@@ -109,8 +109,8 @@ sequenceDiagram
     Bridge->>UI: Binder Transact 1001 (cmd 1201 TouchDown)
     UI->>UI: Render pressed icon animation (500x500 window)
     Bridge->>HBM: Write 1 to lcm_hbm_state
-    HBM-->>Bridge: Confirm status 0xOK
-    Bridge->>Sensor: silfp_sync_optic (sync down)
+    HBM-->>Bridge: Fixed 50 ms settle (no ack node)
+    Bridge->>Sensor: goodix_command(0xa/0xb, 1)
     Sensor->>Sensor: Expose CMOS and capture frame
     Sensor-->>Bridge: Match result (fid / auth token)
     Bridge->>UI: onAuthenticated (fid)
@@ -149,7 +149,7 @@ sequenceDiagram
     UI->>UI: Hide static icon, render pressed icon (500x500)
     UI->>MtkDrm: requestDisplayPower (DRM transitions Doze to Active)
     Bridge->>HBM: set_hbm_sync loop (write 1)
-    HBM-->>Bridge: Confirm active (0xOK received after DRM transition)
+    HBM-->>Bridge: Fixed settle after DRM transition
     Bridge->>Sensor: Execute optical acquisition
     Sensor-->>Bridge: Authentication SUCCESS
     Bridge->>HBM: Write 0 to lcm_hbm_state
@@ -185,8 +185,8 @@ sequenceDiagram
     Bridge->>Bridge: Store pending_auth_capture and hold wakelock
     Framework->>Bridge: ISession authenticate(op_id)
     Bridge->>Bridge: Fulfill pending capture
-    Bridge->>HBM: set_hbm_sync loop (await display wake and 0xOK)
-    HBM-->>Bridge: 0xOK
+    Bridge->>HBM: set_hbm_sync (write + fixed settle)
+    HBM-->>Bridge: settled
     Bridge->>Sensor: Capture image and verify biometric data
     Sensor-->>Bridge: Authentication SUCCESS
     Bridge->>HBM: Write 0 (Disable HBM)
@@ -215,8 +215,6 @@ All artifacts install strictly into `/vendor`:
 │           ├── android.hardware.biometrics.fingerprint@2.1-service-mediatek.xml # Legacy VINTF stub
 │           ├── android.hardware.biometrics.fingerprint@2.3-service.transsion.xml # Legacy VINTF stub
 │           └── manifest_fingerprint.xml                                # Legacy VINTF stub
-└── lib64/
-    └── libsl_fp_impl.so                                                # Patched Silead vendor library (0644)
 ```
 
 ---
@@ -229,8 +227,8 @@ All artifacts install strictly into `/vendor`:
 | **AIDL Service** | [src/service.rs](src/service.rs) | Implements `IFingerprint` and `ISession`. Handles proprietary ColorOS transactions (cmd 1010 for enrollment steps, cmd 1011 for screen state, cmd 1201/1202 for touch dispatch). |
 | **HAL Wrapper** | [src/hal.rs](src/hal.rs) | Wraps vendor C `fingerprint_device_t` methods via `dlopen`/`dlsym`. Filters non-standard internal vendor codes (1001, 1002, 1020) and manages pending capture queues. |
 | **Input Monitor** | [src/input.rs](src/input.rs) | Reads touch events from `/dev/input/event*`, validates coordinates against the FOD area radius (114px around 540, 2172), and injects `KEY_POWER` only when DPMS is `Off`. |
-| **HBM Controller** | [src/hbm.rs](src/hbm.rs) | Manages AMOLED panel brightness mode via `/sys/devices/platform/soc/14013000.dsi/lcm_hbm_state`. Polls for `0xOK` with a 500ms safety timeout. |
-| **Binary Patcher** | [patch_libsl_fp.py](patch_libsl_fp.py) | Patches `libsl_fp_impl.so` to eliminate `silfp_cust_wait_ui_ready` latency, bypass blocking ioctl `wait_finger_status`, and adjust enrollment challenge checks. |
+| **HBM Controller** | [src/hbm.rs](src/hbm.rs) | Manages AMOLED panel brightness mode via `/sys/kernel/tran_display/lcm_hbm_state`. Polls for `0xOK` with a 500ms safety timeout. |
+| **Binary Patcher** | [patch_libgf_hal.py](patch_libgf_hal.py) | Patches `libgf_hal.so` (`tran_uevent_handle` wait and the `uiReadyStatus` gate) so capture fires immediately on finger down. Offsets are hard-coded: verify your build first. |
 
 ---
 
@@ -254,7 +252,7 @@ persist.vendor.fingerprint.optical.iconlocation=228
 # Physical center coordinates of the sensor (X::Y format, e.g., 540::2172)
 persist.vendor.fingerprint.optical.sensorlocation=540::2172
 
-# Optical animation style index (e.g., 5 = white illumination for Silead)
+# Optical animation style index (e.g., 5 = white illumination)
 persist.vendor.fingerprint.optical.iconnumber=5
 
 # ColorOS animation render mode (2 = Frame-by-frame WebP drawables, avoids missing .coz vector assets)
@@ -281,7 +279,7 @@ Run the build script:
 The build script performs the following tasks:
 1. Validates the NDK toolchain and locates the `aarch64-linux-android31-clang` compiler.
 2. Compiles the Rust workspace for `aarch64-linux-android` with release profile optimizations and runs `llvm-strip`.
-3. Executes `patch_libsl_fp.py` on `libsl_fp_impl.so`.
+3. Copies `patch_libgf_hal.py` into `out/` (run it manually on your `libgf_hal.so`).
 4. Assembles the `/vendor` tree inside `out/vendor/`.
 5. Generates the distribution archive `out/transsion-vendor-fod-package.zip`.
 
@@ -326,7 +324,7 @@ Typical output during successful authentication:
 ```text
 I oplus_udfps_transsion: FOD touch detected in sleep at (540, 2172) (KEY 195, screen_state=2) -> activating HBM and capture
 I oplus_udfps_transsion: notify_framework_touch(true): dispatched ColorOS binder transact 1001 (cmd 1201)
-I oplus_udfps_transsion: Hardware LCM HBM confirmed active (0xOK) in 248ms (attempts=12)
+I oplus_udfps_transsion: Hardware LCM HBM enabled
 I oplus_udfps_transsion: Authentication SUCCEEDED for fid 2144737483
 I oplus_udfps_transsion: Hardware LCM HBM disabled
 I oplus_udfps_transsion: notify_framework_touch(false): dispatched ColorOS binder transact 1001 (cmd 1202)
@@ -338,33 +336,3 @@ Confirm that the SystemUI animation window has valid dimensions (`500x500` rathe
 adb shell "dumpsys window windows | grep -A 10 'OnScreenFingerprintPressedIcon'"
 ```
 The output should report `Requested w=500 h=500`.
-
----
-
-## 10. Goodix `gf_fingerprint.default.so` support (crash fix)
-
-The Transsion Goodix HAL (`/odm/lib64/hw/gf_fingerprint.default.so`) does **not** use the AOSP
-`fingerprint_device_t` table. Calling it with the AOSP offsets made `createSession` invoke the
-HAL's `remove(dev, ids*, count)` with `ids = NULL` (SIGSEGV, fault addr 0, `gf_fingerprint.default.so+0x19940`).
-
-`hal.rs` now detects the layout at load time (`_Z17fingerprintNotifyPK18gf_fingerprint_msg` exported => Goodix) and uses:
-
-| Offset | Goodix slot |
-|---|---|
-| 0x80 | set_notify |
-| 0x88 | generateChallenge (result via notify msg 7) |
-| 0x90 | revokeChallenge(dev, challenge) (msg 8) |
-| 0x98 | enroll |
-| 0xa0 | getAuthenticatorId (msg 9) |
-| 0xa8 | invalidateAuthenticatorId (msg 10) |
-| 0xb0 | cancel |
-| 0xb8 | enumerate (msg 6: u32 id list) |
-| 0xc0 | remove(dev, ids*, count<=5) (msg 4: u32 id list) |
-| 0xc8 | set_active_group |
-| 0xd0 | authenticate |
-| 0x110 | command(dev, cmd, arg): 0x0a updateUiReadyStatus, 0x0b updateUiReady |
-
-Silead-specific symbol resolution (`libsl_fp_impl.so`, `silfp_*`) is skipped on the Goodix layout.
-`set_active_group` is now logged before and after the call to make any future crash easy to locate.
-
-Not verified statically: the payload of ENROLLING (msg 3) on this HAL; check `Enroll progress` logs when enrolling.

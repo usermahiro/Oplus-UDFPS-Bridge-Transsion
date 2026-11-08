@@ -106,7 +106,7 @@ impl ISession for SessionService {
         let hal = self.hal.clone();
         std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(5));
-            hal.post_enroll(challenge as u64);
+            hal.post_enroll();
             log_info!("Dispatching onChallengeRevoked(0x{:x}) asynchronously", challenge);
             if let Err(e) = cb.onChallengeRevoked(challenge) {
                 log_error!("cb.onChallengeRevoked failed: {e}");
@@ -158,8 +158,9 @@ impl ISession for SessionService {
         let cb = self.cb.clone();
         let hal = self.hal.clone();
         std::thread::spawn(move || {
-            let raw_ids: Vec<u32> = ids.iter().map(|&id| id as u32).collect();
-            hal.remove_many(&raw_ids);
+            for &id in &ids {
+                hal.remove(id as u32);
+            }
             // Allow up to 150ms for asynchronous notification from vendor HAL
             std::thread::sleep(std::time::Duration::from_millis(150));
             if hal.check_and_clear_remove_pending() {
@@ -193,7 +194,7 @@ impl ISession for SessionService {
         let cb = self.cb.clone();
         std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(5));
-            let new_auth_id = hal.invalidate_authenticator_id();
+            let new_auth_id = hal.get_authenticator_id();
             log_info!("Dispatching onAuthenticatorIdInvalidated(0x{:x}) asynchronously", new_auth_id);
             if let Err(e) = cb.onAuthenticatorIdInvalidated(new_auth_id as i64) {
                 log_error!("cb.onAuthenticatorIdInvalidated failed: {e}");
@@ -389,7 +390,8 @@ pub fn handle_oplus_custom_transact(
     let res: i32 = match cmd_id {
         1010 => {
             // getEnrollmentTotalTimes: ColorOS expects total enrollment steps.
-            // Silead optical UDFPS enrolls in 20 steps (remaining from 19 down to 0).
+            // Total enrollment steps. 20 is inherited from the old Silead path; verify the real Goodix
+            // value against the "Enroll raw words" log before relying on it.
             log_info!("Handling OPlus custom cmd 1010 (getEnrollmentTotalTimes) -> returning 20 steps");
             20
         }
