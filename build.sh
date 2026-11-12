@@ -4,6 +4,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OUT_DIR="${SCRIPT_DIR}/out"
 API_LEVEL="${API_LEVEL:-31}"
+FOD_DELAY_US="${FOD_DELAY_US:-30000}"
+PATCH_STRICT="${PATCH_STRICT:-0}"
+PREBUILT_BIN="${PREBUILT_BIN:-}"
 
 # ANSI Colors
 RED='\033[0;31m'
@@ -32,6 +35,9 @@ Environment variables:
   ANDROID_NDK_HOME  Path to Android NDK toolchain
   API_LEVEL         Target Android API level (default: 31)
   CARGO             Path to cargo binary
+  FOD_DELAY_US      Jeda pengganti uevent di libgf_hal (us, default 30000). Lebih kecil = FOD lebih responsif
+  PATCH_STRICT=1    Tolak libgf_hal.so yang hash-nya belum dikenal patcher
+  PREBUILT_BIN      (test) lewati cargo dan pakai biner ini
 EOF
     exit 0
 }
@@ -44,7 +50,7 @@ case "$CMD" in
         ;;
     clean)
         log_info "Cleaning build artifacts..."
-        rm -rf "${OUT_DIR}" "${SCRIPT_DIR}/target"
+        rm -rf "${OUT_DIR}" "${SCRIPT_DIR}/target" "${SCRIPT_DIR}/libsl_fp_impl.so.patched"
         log_success "Clean completed."
         exit 0
         ;;
@@ -57,6 +63,7 @@ case "$CMD" in
         ;;
 esac
 
+if [ -z "$PREBUILT_BIN" ]; then
 # Locate Android NDK
 find_ndk() {
     for var in "${ANDROID_NDK_HOME:-}" "${ANDROID_NDK_ROOT:-}" "${ANDROID_NDK_LATEST_HOME:-}" "${NDK_HOME:-}"; do
@@ -179,7 +186,6 @@ log_info "Using Cargo: $CARGO_BIN"
 
 cd "$SCRIPT_DIR"
 
-# 1. Compile via Cargo
 if [ "$PROFILE" = "release" ]; then
     "$CARGO_BIN" build --target aarch64-linux-android --release
     BIN="target/aarch64-linux-android/release/android-hardware-biometrics-fingerprint-service-transsion"
@@ -194,17 +200,24 @@ else
     "$CARGO_BIN" build --target aarch64-linux-android
     BIN="target/aarch64-linux-android/debug/android-hardware-biometrics-fingerprint-service-transsion"
 fi
+else
+    PROFILE="${PROFILE:-release}"
+    BIN="$PREBUILT_BIN"
+    log_warn "PREBUILT_BIN diset: melewati cargo/NDK ($BIN)"
+    cd "$SCRIPT_DIR"
+fi
 
-# 2. Prepare output layout
 log_info "Assembling output package in ${OUT_DIR}..."
 rm -rf "$OUT_DIR"
 mkdir -p "$OUT_DIR/vendor/bin/hw"
 mkdir -p "$OUT_DIR/vendor/etc/init"
 mkdir -p "$OUT_DIR/vendor/etc/vintf/manifest"
 
-# 3. Copy files and enforce standard permissions
 cp -f "$BIN" "$OUT_DIR/vendor/bin/hw/android.hardware.biometrics.fingerprint-service.transsion"
 chmod 0755 "$OUT_DIR/vendor/bin/hw/android.hardware.biometrics.fingerprint-service.transsion"
+
+cp -f "$BIN" "$OUT_DIR/vendor/bin/hw/android.hardware.biometrics.fingerprint-service"
+chmod 0755 "$OUT_DIR/vendor/bin/hw/android.hardware.biometrics.fingerprint-service"
 
 cp -f "${SCRIPT_DIR}/android.hardware.biometrics.fingerprint-service.transsion.rc" "$OUT_DIR/vendor/etc/init/"
 chmod 0644 "$OUT_DIR/vendor/etc/init/android.hardware.biometrics.fingerprint-service.transsion.rc"
@@ -212,7 +225,6 @@ chmod 0644 "$OUT_DIR/vendor/etc/init/android.hardware.biometrics.fingerprint-ser
 cp -f "${SCRIPT_DIR}/manifest_fingerprint_transsion.xml" "$OUT_DIR/vendor/etc/vintf/manifest/"
 chmod 0644 "$OUT_DIR/vendor/etc/vintf/manifest/manifest_fingerprint_transsion.xml"
 
-# Automatically mask and disable obsolete legacy HIDL HAL services and manifests
 echo '<manifest version="1.0" type="device"/>' > "$OUT_DIR/vendor/etc/vintf/manifest/android.hardware.biometrics.fingerprint@2.1-service-mediatek.xml"
 echo '<manifest version="1.0" type="device"/>' > "$OUT_DIR/vendor/etc/vintf/manifest/android.hardware.biometrics.fingerprint@2.3-service.transsion.xml"
 echo '<manifest version="1.0" type="device"/>' > "$OUT_DIR/vendor/etc/vintf/manifest/manifest_fingerprint.xml"
@@ -222,26 +234,66 @@ echo "# Disabled in favor of AIDL Fingerprint HAL" > "$OUT_DIR/vendor/etc/init/a
 echo "# Disabled in favor of AIDL Fingerprint HAL" > "$OUT_DIR/vendor/etc/init/android.hardware.biometrics.fingerprint@2.3-service.transsion.rc"
 chmod 0644 "$OUT_DIR/vendor/etc/init/"*.rc
 
-# 4. Copy utility scripts to out
+if [ -f "${SCRIPT_DIR}/libsl_fp_impl.so" ] && [ -f "${SCRIPT_DIR}/patch_libsl_fp.py" ]; then
+    log_info "Generating pre-patched libsl_fp_impl.so for Camon 30 Pro (KJ7)..."
+    python3 "${SCRIPT_DIR}/patch_libsl_fp.py" "${SCRIPT_DIR}/libsl_fp_impl.so"
+    if [ -f "${SCRIPT_DIR}/libsl_fp_impl.so.patched" ]; then
+        mkdir -p "$OUT_DIR/vendor/lib64"
+        cp -f "${SCRIPT_DIR}/libsl_fp_impl.so.patched" "$OUT_DIR/vendor/lib64/libsl_fp_impl.so"
+        chmod 0644 "$OUT_DIR/vendor/lib64/libsl_fp_impl.so"
+        rm -f "${SCRIPT_DIR}/libsl_fp_impl.so.patched"
+    fi
+fi
+
 cp -f "${SCRIPT_DIR}/patch_libgf_hal.py" "$OUT_DIR/" 2>/dev/null || true
 
-# 6. Package archives
-log_info "Packaging distribution archives..."
-tar -czf "${OUT_DIR}/transsion-vendor-fod-package.tar.gz" -C "${OUT_DIR}" vendor
+ODM_SRC="${SCRIPT_DIR}/prebuilt"
+if [ -d "$ODM_SRC" ]; then
+    log_info "Assembling odm layout (delay ${FOD_DELAY_US}us)..."
+    for f in lib64/libgf_hal.so lib64/hw/gf_fingerprint.default.so; do
+        [ -f "$ODM_SRC/$f" ] || { log_error "prebuilt/$f tidak ada"; exit 1; }
+    done
+    mkdir -p "$OUT_DIR/odm/lib64/hw"
+
+    PATCH_ARGS=(--delay-us "$FOD_DELAY_US")
+    [ "$PATCH_STRICT" = "1" ] && PATCH_ARGS+=(--strict)
+    python3 -I "${SCRIPT_DIR}/patch_libgf_hal.py" "$ODM_SRC/lib64/libgf_hal.so" \
+        -o "$OUT_DIR/odm/lib64/libgf_hal.so" "${PATCH_ARGS[@]}"
+
+    if cmp -s "$ODM_SRC/lib64/libgf_hal.so" "$OUT_DIR/odm/lib64/libgf_hal.so"; then
+        log_error "libgf_hal.so hasil patch identik dengan aslinya"; exit 1
+    fi
+    python3 -I "${SCRIPT_DIR}/patch_libgf_hal.py" "$OUT_DIR/odm/lib64/libgf_hal.so" \
+        --delay-us "$FOD_DELAY_US" --check | grep -q "0 instruksi akan diubah" \
+        || { log_error "verifikasi ulang patch gagal"; exit 1; }
+
+    cp -f "$ODM_SRC/lib64/hw/gf_fingerprint.default.so" "$OUT_DIR/odm/lib64/hw/"
+    if [ -f "$ODM_SRC/etc/init/fingerprint-default.rc" ]; then
+        mkdir -p "$OUT_DIR/odm/etc/init"
+        cp -f "$ODM_SRC/etc/init/fingerprint-default.rc" "$OUT_DIR/odm/etc/init/"
+    fi
+    find "$OUT_DIR/odm" -type f -exec chmod 0644 {} +
+else
+    log_warn "prebuilt/ tidak ada; paket hanya berisi vendor/"
+fi
+
+log_info "Packaging distribution archives (vendor + odm)..."
+PKG_DIRS=(vendor)
+[ -d "${OUT_DIR}/odm" ] && PKG_DIRS+=(odm)
+
+tar -czf "${OUT_DIR}/transsion-vendor-fod-package.tar.gz" -C "${OUT_DIR}" "${PKG_DIRS[@]}"
 
 if command -v zip &>/dev/null; then
-    (cd "${OUT_DIR}" && zip -rq "transsion-vendor-fod-package.zip" vendor patch_*.py 2>/dev/null || zip -rq "transsion-vendor-fod-package.zip" vendor)
+    (cd "${OUT_DIR}" && zip -rq "transsion-vendor-fod-package.zip" "${PKG_DIRS[@]}")
 else
-    python3 -c '
+    PKG_DIRS_CSV="${PKG_DIRS[*]}" python3 -c '
 import zipfile, os
 os.chdir("'"${OUT_DIR}"'")
 with zipfile.ZipFile("transsion-vendor-fod-package.zip", "w", zipfile.ZIP_DEFLATED) as z:
-    for root, _, files in os.walk("vendor"):
-        for f in files:
-            z.write(os.path.join(root, f))
-    for f in ["patch_libgf_hal.py"]:
-        if os.path.exists(f):
-            z.write(f)
+    for d in os.environ["PKG_DIRS_CSV"].split():
+        for root, _, files in os.walk(d):
+            for f in files:
+                z.write(os.path.join(root, f))
 '
 fi
 
@@ -250,5 +302,5 @@ log_success "Build completed successfully!"
 echo -e "${BOLD}Output Files (${OUT_DIR}):${NC}"
 ls -lh "${OUT_DIR}" | grep -E '\.(tar\.gz|zip)$' || true
 echo ""
-echo -e "${BOLD}Vendor Files Structure:${NC}"
-find "${OUT_DIR}/vendor" -type f -exec ls -lh {} +
+echo -e "${BOLD}Package Files Structure:${NC}"
+find "${OUT_DIR}/vendor" "${OUT_DIR}/odm" -type f -exec ls -lh {} + 2>/dev/null

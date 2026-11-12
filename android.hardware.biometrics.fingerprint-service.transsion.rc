@@ -1,4 +1,4 @@
-service vendor.fingerprint-default /vendor/bin/hw/android.hardware.biometrics.fingerprint-service.transsion
+service vendor.fingerprint-default /vendor/bin/hw/android.hardware.biometrics.fingerprint-service.transsion default
     class hal
     user system
     group system input uhid wakelock
@@ -21,4 +21,3 @@ on post-fs-data
 
 on property:sys.boot_completed=1
     start vendor.fingerprint-default
-

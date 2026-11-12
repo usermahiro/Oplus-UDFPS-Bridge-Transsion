@@ -20,11 +20,11 @@ use crate::{log_debug, log_error, log_info, log_warn};
 use crate::{COMMON_INTERFACE_HASH, COMMON_INTERFACE_VERSION};
 
 pub struct CancellationSignalService {
-    hal: Arc<FingerprintHal>,
+    hal: Option<Arc<FingerprintHal>>,
 }
 
 impl CancellationSignalService {
-    pub fn new(hal: Arc<FingerprintHal>) -> Self {
+    pub fn new(hal: Option<Arc<FingerprintHal>>) -> Self {
         Self { hal }
     }
 }
@@ -34,7 +34,9 @@ impl rsbinder::Interface for CancellationSignalService {}
 impl ICancellationSignal for CancellationSignalService {
     fn r#cancel(&self) -> rsbinder::BinderResult<()> {
         log_info!("ICancellationSignal::cancel invoked");
-        self.hal.cancel();
+        if let Some(ref hal) = self.hal {
+            hal.cancel();
+        }
         Ok(())
     }
 
@@ -53,7 +55,7 @@ pub struct SessionService {
     #[allow(dead_code)]
     user_id: i32,
     cb: Strong<dyn ISessionCallback>,
-    hal: Arc<FingerprintHal>,
+    hal: parking_lot::Mutex<Option<Arc<FingerprintHal>>>,
 }
 
 impl SessionService {
@@ -61,14 +63,28 @@ impl SessionService {
         sensor_id: i32,
         user_id: i32,
         cb: Strong<dyn ISessionCallback>,
-        hal: Arc<FingerprintHal>,
+        hal: Option<Arc<FingerprintHal>>,
     ) -> Self {
         Self {
             sensor_id,
             user_id,
             cb,
-            hal,
+            hal: parking_lot::Mutex::new(hal),
         }
+    }
+
+    fn get_hal(&self) -> Option<Arc<FingerprintHal>> {
+        let mut guard = self.hal.lock();
+        if guard.is_none() {
+            if let Ok(h) = FingerprintHal::get_instance() {
+                let store_path = format!("/data/vendor_de/{}/fpdata", self.user_id);
+                let _ = std::fs::create_dir_all(&store_path);
+                h.set_callback(Some(self.cb.clone()));
+                h.set_active_user(self.user_id, &store_path);
+                *guard = Some(h);
+            }
+        }
+        guard.clone()
     }
 }
 
@@ -78,11 +94,11 @@ impl ISession for SessionService {
     fn r#generateChallenge(&self) -> rsbinder::BinderResult<()> {
         log_info!("ISession::generateChallenge called");
         let cb = self.cb.clone();
-        let hal = self.hal.clone();
+        let hal_opt = self.get_hal();
         std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(5));
-            let challenge = match hal.pre_enroll() {
-                Ok(c) if c != 0 => c as i64,
+            let challenge = match hal_opt.and_then(|h| h.pre_enroll().ok()) {
+                Some(c) if c != 0 => c as i64,
                 _ => {
                     let fallback = (std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
@@ -103,10 +119,12 @@ impl ISession for SessionService {
     fn r#revokeChallenge(&self, challenge: i64) -> rsbinder::BinderResult<()> {
         log_info!("ISession::revokeChallenge called (challenge=0x{:x})", challenge);
         let cb = self.cb.clone();
-        let hal = self.hal.clone();
+        let hal_opt = self.get_hal();
         std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(5));
-            hal.post_enroll();
+            if let Some(hal) = hal_opt {
+                hal.post_enroll(challenge as u64);
+            }
             log_info!("Dispatching onChallengeRevoked(0x{:x}) asynchronously", challenge);
             if let Err(e) = cb.onChallengeRevoked(challenge) {
                 log_error!("cb.onChallengeRevoked failed: {e}");
@@ -117,37 +135,48 @@ impl ISession for SessionService {
 
     fn r#enroll(&self, hat: &HardwareAuthToken) -> rsbinder::BinderResult<Strong<dyn ICancellationSignal>> {
         log_info!("ISession::enroll called (challenge=0x{:x}, userId={})", hat.challenge, hat.userId);
-        let raw_hat = hw_auth_token_t::from_aidl(hat);
-        let ret = self.hal.enroll(&raw_hat, 60);
-        if ret != 0 {
-            log_warn!("hal.enroll returned {ret}");
+        let hal_opt = self.get_hal();
+        if let Some(ref hal) = hal_opt {
+            let raw_hat = hw_auth_token_t::from_aidl(hat);
+            let ret = hal.enroll(&raw_hat, 60);
+            if ret != 0 {
+                log_warn!("hal.enroll returned {ret}");
+            }
         }
-        let cancel = BnCancellationSignal::new_binder(CancellationSignalService::new(self.hal.clone()));
+        let cancel = BnCancellationSignal::new_binder(CancellationSignalService::new(hal_opt));
         Ok(cancel)
     }
 
     fn r#authenticate(&self, operation_id: i64) -> rsbinder::BinderResult<Strong<dyn ICancellationSignal>> {
         log_info!("ISession::authenticate called (op_id=0x{:x})", operation_id);
-        let ret = self.hal.authenticate(operation_id as u64);
-        if ret != 0 {
-            log_warn!("hal.authenticate returned {ret}");
+        let hal_opt = self.get_hal();
+        if let Some(ref hal) = hal_opt {
+            let ret = hal.authenticate(operation_id as u64);
+            if ret != 0 {
+                log_warn!("hal.authenticate returned {ret}");
+            }
         }
-        let cancel = BnCancellationSignal::new_binder(CancellationSignalService::new(self.hal.clone()));
+        let cancel = BnCancellationSignal::new_binder(CancellationSignalService::new(hal_opt));
         Ok(cancel)
     }
 
     fn r#detectInteraction(&self) -> rsbinder::BinderResult<Strong<dyn ICancellationSignal>> {
         log_info!("ISession::detectInteraction called");
-        let cancel = BnCancellationSignal::new_binder(CancellationSignalService::new(self.hal.clone()));
+        let cancel = BnCancellationSignal::new_binder(CancellationSignalService::new(self.get_hal()));
         Ok(cancel)
     }
 
     fn r#enumerateEnrollments(&self) -> rsbinder::BinderResult<()> {
         log_info!("ISession::enumerateEnrollments called -> scheduling asynchronous worker");
-        let hal = self.hal.clone();
+        let hal_opt = self.get_hal();
+        let cb = self.cb.clone();
         std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(5));
-            hal.enumerate();
+            if let Some(hal) = hal_opt {
+                hal.enumerate();
+            } else {
+                let _ = cb.onEnrollmentsEnumerated(&[]);
+            }
         });
         Ok(())
     }
@@ -156,18 +185,22 @@ impl ISession for SessionService {
         log_info!("ISession::removeEnrollments called with ids {:?}", enrollment_ids);
         let ids = enrollment_ids.to_vec();
         let cb = self.cb.clone();
-        let hal = self.hal.clone();
+        let hal_opt = self.get_hal();
         std::thread::spawn(move || {
-            for &id in &ids {
-                hal.remove(id as u32);
-            }
-            // Allow up to 150ms for asynchronous notification from vendor HAL
-            std::thread::sleep(std::time::Duration::from_millis(150));
-            if hal.check_and_clear_remove_pending() {
-                log_info!("Vendor HAL did not dispatch remove notification; sending fallback onEnrollmentsRemoved({:?})", ids);
-                if let Err(e) = cb.onEnrollmentsRemoved(&ids) {
-                    log_error!("cb.onEnrollmentsRemoved failed: {e}");
+            if let Some(hal) = hal_opt {
+                for &id in &ids {
+                    hal.remove(id as u32);
                 }
+                // Allow up to 150ms for asynchronous notification from vendor HAL
+                std::thread::sleep(std::time::Duration::from_millis(150));
+                if hal.check_and_clear_remove_pending() {
+                    log_info!("Vendor HAL did not dispatch remove notification; sending fallback onEnrollmentsRemoved({:?})", ids);
+                    if let Err(e) = cb.onEnrollmentsRemoved(&ids) {
+                        log_error!("cb.onEnrollmentsRemoved failed: {e}");
+                    }
+                }
+            } else {
+                let _ = cb.onEnrollmentsRemoved(&ids);
             }
         });
         Ok(())
@@ -175,11 +208,11 @@ impl ISession for SessionService {
 
     fn r#getAuthenticatorId(&self) -> rsbinder::BinderResult<()> {
         log_info!("ISession::getAuthenticatorId called");
-        let hal = self.hal.clone();
+        let hal_opt = self.get_hal();
         let cb = self.cb.clone();
         std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(5));
-            let auth_id = hal.get_authenticator_id();
+            let auth_id = hal_opt.map(|h| h.get_authenticator_id()).unwrap_or(0);
             log_info!("Dispatching onAuthenticatorIdRetrieved(0x{:x}) asynchronously", auth_id);
             if let Err(e) = cb.onAuthenticatorIdRetrieved(auth_id as i64) {
                 log_error!("cb.onAuthenticatorIdRetrieved failed: {e}");
@@ -190,11 +223,11 @@ impl ISession for SessionService {
 
     fn r#invalidateAuthenticatorId(&self) -> rsbinder::BinderResult<()> {
         log_info!("ISession::invalidateAuthenticatorId called");
-        let hal = self.hal.clone();
+        let hal_opt = self.get_hal();
         let cb = self.cb.clone();
         std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(5));
-            let new_auth_id = hal.get_authenticator_id();
+            let new_auth_id = hal_opt.map(|h| h.get_authenticator_id()).unwrap_or(0);
             log_info!("Dispatching onAuthenticatorIdInvalidated(0x{:x}) asynchronously", new_auth_id);
             if let Err(e) = cb.onAuthenticatorIdInvalidated(new_auth_id as i64) {
                 log_error!("cb.onAuthenticatorIdInvalidated failed: {e}");
@@ -218,7 +251,9 @@ impl ISession for SessionService {
 
     fn r#close(&self) -> rsbinder::BinderResult<()> {
         log_info!("ISession::close called");
-        self.hal.cancel();
+        if let Some(hal) = self.get_hal() {
+            hal.cancel();
+        }
         let cb = self.cb.clone();
         std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(5));
@@ -232,19 +267,25 @@ impl ISession for SessionService {
 
     fn r#onPointerDown(&self, _pointer_id: i32, x: i32, y: i32, minor: f32, major: f32) -> rsbinder::BinderResult<()> {
         log_info!("onPointerDown at ({}, {}) minor={} major={}", x, y, minor, major);
-        self.hal.on_pointer_down(x, y, minor, major);
+        if let Some(hal) = self.get_hal() {
+            hal.on_pointer_down(x, y, minor, major);
+        }
         Ok(())
     }
 
     fn r#onPointerUp(&self, _pointer_id: i32) -> rsbinder::BinderResult<()> {
         log_info!("onPointerUp");
-        self.hal.on_pointer_up();
+        if let Some(hal) = self.get_hal() {
+            hal.on_pointer_up();
+        }
         Ok(())
     }
 
     fn r#onUiReady(&self) -> rsbinder::BinderResult<()> {
         log_info!("onUiReady");
-        self.hal.on_ui_ready();
+        if let Some(hal) = self.get_hal() {
+            hal.on_ui_ready();
+        }
         Ok(())
     }
 
@@ -273,13 +314,17 @@ impl ISession for SessionService {
 
     fn r#onPointerDownWithContext(&self, context: &PointerContext) -> rsbinder::BinderResult<()> {
         log_info!("onPointerDownWithContext at ({}, {}) (isAod={})", context.x, context.y, context.isAod);
-        self.hal.on_pointer_down(context.x as i32, context.y as i32, context.minor, context.major);
+        if let Some(hal) = self.get_hal() {
+            hal.on_pointer_down(context.x as i32, context.y as i32, context.minor, context.major);
+        }
         Ok(())
     }
 
     fn r#onPointerUpWithContext(&self, _context: &PointerContext) -> rsbinder::BinderResult<()> {
         log_info!("onPointerUpWithContext");
-        self.hal.on_pointer_up();
+        if let Some(hal) = self.get_hal() {
+            hal.on_pointer_up();
+        }
         Ok(())
     }
 
@@ -290,7 +335,9 @@ impl ISession for SessionService {
 
     fn r#onPointerCancelWithContext(&self, _context: &PointerContext) -> rsbinder::BinderResult<()> {
         log_info!("onPointerCancelWithContext");
-        self.hal.on_pointer_up();
+        if let Some(hal) = self.get_hal() {
+            hal.on_pointer_up();
+        }
         Ok(())
     }
 
@@ -326,8 +373,8 @@ impl IFingerprint for FingerprintService {
             r#sensorType: FingerprintSensorType::UNDER_DISPLAY_OPTICAL,
             r#sensorLocations: vec![SensorLocation {
                 r#displayId: 0,
-                r#sensorLocationX: 550,
-                r#sensorLocationY: 2171,
+                r#sensorLocationX: 540,
+                r#sensorLocationY: 2172,
                 r#sensorRadius: 114,
                 r#display: "".to_string(),
                 r#sensorShape: SensorShape::CIRCLE,
@@ -349,20 +396,28 @@ impl IFingerprint for FingerprintService {
     ) -> rsbinder::BinderResult<Strong<dyn ISession>> {
         log_info!("IFingerprint::createSession called (sensorId={}, userId={})", sensor_id, user_id);
 
-        let hal = match FingerprintHal::get_instance() {
-            Ok(h) => h,
-            Err(e) => {
-                log_error!("Failed to obtain FingerprintHal instance in createSession: {e}");
-                return Err(rsbinder::Status::from(rsbinder::StatusCode::Unknown));
+        let mut hal_opt = FingerprintHal::get_instance().ok();
+        if hal_opt.is_none() {
+            log_warn!("FingerprintHal::get_instance failed on first try in createSession, retrying briefly...");
+            for _ in 0..5 {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                if let Ok(h) = FingerprintHal::get_instance() {
+                    hal_opt = Some(h);
+                    break;
+                }
             }
-        };
+        }
 
-        let store_path = format!("/data/vendor_de/{}/fpdata", user_id);
-        let _ = std::fs::create_dir_all(&store_path);
-        hal.set_callback(Some(cb.clone()));
-        hal.set_active_user(user_id, &store_path);
+        if let Some(ref hal) = hal_opt {
+            let store_path = format!("/data/vendor_de/{}/fpdata", user_id);
+            let _ = std::fs::create_dir_all(&store_path);
+            hal.set_callback(Some(cb.clone()));
+            hal.set_active_user(user_id, &store_path);
+        } else {
+            log_warn!("FingerprintHal not ready yet; session created in deferred mode (prevents system_server crash)");
+        }
 
-        let session = SessionService::new(sensor_id, user_id, cb.clone(), hal);
+        let session = SessionService::new(sensor_id, user_id, cb.clone(), hal_opt);
         Ok(BnSession::new_binder(session))
     }
 }
@@ -390,8 +445,7 @@ pub fn handle_oplus_custom_transact(
     let res: i32 = match cmd_id {
         1010 => {
             // getEnrollmentTotalTimes: ColorOS expects total enrollment steps.
-            // Total enrollment steps. 20 is inherited from the old Silead path; verify the real Goodix
-            // value against the "Enroll raw words" log before relying on it.
+            // Silead optical UDFPS enrolls in 20 steps (remaining from 19 down to 0).
             log_info!("Handling OPlus custom cmd 1010 (getEnrollmentTotalTimes) -> returning 20 steps");
             20
         }

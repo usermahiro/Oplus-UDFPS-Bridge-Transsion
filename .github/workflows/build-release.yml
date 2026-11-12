@@ -1,0 +1,116 @@
+name: Build & Release
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "**.md"
+      - "LICENSE"
+  workflow_dispatch:
+    inputs:
+      prerelease:
+        description: "Tandai sebagai pre-release"
+        type: boolean
+        default: false
+      delay_us:
+        description: "Jeda pengganti uevent libgf_hal (mikrodetik). Lebih kecil = FOD lebih responsif"
+        type: string
+        default: "30000"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-release-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Versi mengikuti nomor run workflow: 1.0.<run_number>
+  VERSION_MAJOR_MINOR: "1.0"
+  API_LEVEL: "31"
+  FOD_DELAY_US: ${{ inputs.delay_us || '30000' }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set version from workflow run
+        id: ver
+        run: |
+          VERSION="${VERSION_MAJOR_MINOR}.${{ github.run_number }}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=v${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
+          # Sinkronkan versi crate dengan versi rilis
+          sed -i "0,/^version = \".*\"/s//version = \"${VERSION}\"/" Cargo.toml
+          grep -m1 '^version' Cargo.toml
+          echo "### Build v${VERSION} (run #${{ github.run_number }})" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Install Rust (aarch64-linux-android)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Locate Android NDK
+        run: |
+          NDK="${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_HOME:-}}"
+          if [ -z "$NDK" ] || [ ! -d "$NDK" ]; then
+            echo "::error::Android NDK tidak ditemukan di runner"
+            exit 1
+          fi
+          echo "ANDROID_NDK_HOME=$NDK" >> "$GITHUB_ENV"
+          echo "Using NDK: $NDK"
+
+      - name: Build (cargo release + patch libgf_hal + pack)
+        run: bash build.sh release
+
+      - name: Prepare release assets
+        run: |
+          mkdir -p dist
+          cp out/transsion-vendor-fod-package.zip    "dist/transsion-vendor-fod-package-v${VERSION}.zip"
+          cp out/transsion-vendor-fod-package.tar.gz "dist/transsion-vendor-fod-package-v${VERSION}.tar.gz"
+          echo "Isi paket:"; unzip -l "dist/transsion-vendor-fod-package-v${VERSION}.zip"
+          # Pastikan layout top-level hanya vendor/ dan odm/
+          TOP=$(unzip -Z1 "dist/transsion-vendor-fod-package-v${VERSION}.zip" | cut -d/ -f1 | sort -u | tr '\n' ' ')
+          echo "Top-level: $TOP"
+          [ "$TOP" = "odm vendor " ] || { echo "::error::Layout paket salah: $TOP"; exit 1; }
+          # Pastikan path file kunci ada persis di tempat yang benar
+          for f in vendor/bin/hw/android.hardware.biometrics.fingerprint-service.transsion \
+                   odm/lib64/libgf_hal.so odm/lib64/hw/gf_fingerprint.default.so; do
+            unzip -Z1 "dist/transsion-vendor-fod-package-v${VERSION}.zip" | grep -qx "$f" \
+              || { echo "::error::File wajib tidak ada di paket: $f"; exit 1; }
+          done
+          (cd dist && sha256sum * > "SHA256SUMS-v${VERSION}.txt")
+          ls -lh dist
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: transsion-fod-v${{ steps.ver.outputs.version }}
+          path: dist/*
+          if-no-files-found: error
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.tag }}
+          name: "Mahiro FOD BridgeAIDL v${{ steps.ver.outputs.version }}"
+          target_commitish: ${{ github.sha }}
+          prerelease: ${{ github.event_name == 'workflow_dispatch' && inputs.prerelease || false }}
+          generate_release_notes: true
+          body: |
+            Build otomatis dari workflow run #${{ github.run_number }} (commit `${{ github.sha }}`).
+
+            **Isi paket**
+            - `transsion-vendor-fod-package-v${{ steps.ver.outputs.version }}.zip` / `.tar.gz` dengan layout:
+              - `vendor/` — `bin/hw/` binary HAL AIDL (Rust), `etc/init` rc, `etc/vintf/manifest`
+              - `odm/` — `lib64/libgf_hal.so` (dipatch saat build, jeda ${{ env.FOD_DELAY_US }} us), `lib64/hw/gf_fingerprint.default.so`
+            - `SHA256SUMS-v${{ steps.ver.outputs.version }}.txt`
+          files: dist/*

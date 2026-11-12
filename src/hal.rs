@@ -195,10 +195,59 @@ const _: () = {
     assert!(std::mem::size_of::<fingerprint_device_t>() == 0xf0);
 };
 
+#[repr(C)]
+pub struct goodix_fingerprint_device_t {
+    pub common: hw_device_t,
+    pub notify: Option<fingerprint_notify_t>,
+    pub set_notify: Option<unsafe extern "C" fn(dev: *mut fingerprint_device_t, notify: fingerprint_notify_t) -> libc::c_int>,
+    pub pre_enroll: Option<unsafe extern "C" fn(dev: *mut fingerprint_device_t) -> u64>,
+    pub post_enroll: Option<unsafe extern "C" fn(dev: *mut fingerprint_device_t, challenge: u64) -> libc::c_int>,
+    pub enroll: Option<unsafe extern "C" fn(dev: *mut fingerprint_device_t, hat: *const hw_auth_token_t, gid: u32, timeout_sec: u32) -> libc::c_int>,
+    pub get_authenticator_id: Option<unsafe extern "C" fn(dev: *mut fingerprint_device_t) -> u64>,
+    pub invalidate_authenticator_id: Option<unsafe extern "C" fn(dev: *mut fingerprint_device_t) -> u64>,
+    pub cancel: Option<unsafe extern "C" fn(dev: *mut fingerprint_device_t) -> libc::c_int>,
+    pub enumerate: Option<unsafe extern "C" fn(dev: *mut fingerprint_device_t) -> libc::c_int>,
+    pub remove: Option<unsafe extern "C" fn(dev: *mut fingerprint_device_t, fids: *const u32, count: u32) -> libc::c_int>,
+    pub set_active_group: Option<unsafe extern "C" fn(dev: *mut fingerprint_device_t, gid: u32, store_path: *const libc::c_char) -> libc::c_int>,
+    pub authenticate: Option<unsafe extern "C" fn(dev: *mut fingerprint_device_t, operation_id: u64, gid: u32) -> libc::c_int>,
+    pub vendor_event_2: Option<unsafe extern "C" fn(dev: *mut fingerprint_device_t) -> libc::c_int>,
+    pub vendor_event_4: Option<unsafe extern "C" fn(dev: *mut fingerprint_device_t) -> libc::c_int>,
+    pub reserved: [usize; 5],
+    pub send_custom_cmd: Option<unsafe extern "C" fn(dev: *mut fingerprint_device_t, cmd: u32, arg: u32) -> libc::c_int>,
+    pub reserved2: [usize; 3],
+}
+
+const _: () = {
+    assert!(std::mem::offset_of!(goodix_fingerprint_device_t, notify) == 0x78);
+    assert!(std::mem::offset_of!(goodix_fingerprint_device_t, set_notify) == 0x80);
+    assert!(std::mem::offset_of!(goodix_fingerprint_device_t, pre_enroll) == 0x88);
+    assert!(std::mem::offset_of!(goodix_fingerprint_device_t, post_enroll) == 0x90);
+    assert!(std::mem::offset_of!(goodix_fingerprint_device_t, enroll) == 0x98);
+    assert!(std::mem::offset_of!(goodix_fingerprint_device_t, get_authenticator_id) == 0xa0);
+    assert!(std::mem::offset_of!(goodix_fingerprint_device_t, invalidate_authenticator_id) == 0xa8);
+    assert!(std::mem::offset_of!(goodix_fingerprint_device_t, cancel) == 0xb0);
+    assert!(std::mem::offset_of!(goodix_fingerprint_device_t, enumerate) == 0xb8);
+    assert!(std::mem::offset_of!(goodix_fingerprint_device_t, remove) == 0xc0);
+    assert!(std::mem::offset_of!(goodix_fingerprint_device_t, set_active_group) == 0xc8);
+    assert!(std::mem::offset_of!(goodix_fingerprint_device_t, authenticate) == 0xd0);
+    assert!(std::mem::offset_of!(goodix_fingerprint_device_t, vendor_event_2) == 0xd8);
+    assert!(std::mem::offset_of!(goodix_fingerprint_device_t, vendor_event_4) == 0xe0);
+    assert!(std::mem::offset_of!(goodix_fingerprint_device_t, reserved) == 0xe8);
+    assert!(std::mem::offset_of!(goodix_fingerprint_device_t, send_custom_cmd) == 0x110);
+    assert!(std::mem::size_of::<goodix_fingerprint_device_t>() == 0x130);
+};
+
+type FnSileadCustCmd = unsafe extern "C" fn(cmd: u32, arg: u32) -> libc::c_int;
 type FnGoodixCustCmd = unsafe extern "C" fn(dev: *mut fingerprint_device_t, cmd: u32, arg: u32) -> libc::c_int;
+type FnSilfpCustInit = unsafe extern "C" fn() -> libc::c_int;
+type FnSilfpSyncOptic = unsafe extern "C" fn(status: i32) -> libc::c_int;
+type FnSilfpSyncFinger = unsafe extern "C" fn() -> libc::c_int;
+type FnSilfpMsgSend = unsafe extern "C" fn(msg: i32) -> libc::c_int;
+type FnSilfpWorkerScreenState = unsafe extern "C" fn(state: libc::c_int) -> libc::c_int;
 
 pub struct FingerprintHal {
     device: *mut fingerprint_device_t,
+    is_goodix: bool,
     current_callback: Arc<Mutex<Option<Strong<dyn ISessionCallback>>>>,
     is_active: AtomicBool,
     is_finger_down: AtomicBool,
@@ -206,7 +255,15 @@ pub struct FingerprintHal {
     enumerated_ids: Mutex<Vec<i32>>,
     enum_completed: Arc<AtomicBool>,
     remove_pending: Arc<AtomicBool>,
+    fn_silead_cmd: Option<FnSileadCustCmd>,
     fn_goodix_cmd: Option<FnGoodixCustCmd>,
+    #[allow(dead_code)]
+    fn_silfp_cust_init: Option<FnSilfpCustInit>,
+    fn_silfp_sync_optic: Option<FnSilfpSyncOptic>,
+    fn_silfp_sync_down: Option<FnSilfpSyncFinger>,
+    fn_silfp_sync_up: Option<FnSilfpSyncFinger>,
+    fn_silfp_msg_send: Option<FnSilfpMsgSend>,
+    fn_silfp_worker_screen_state: Option<FnSilfpWorkerScreenState>,
     saved_enroll_fid: AtomicI32,
     step_captured: AtomicBool,
     pub screen_state: AtomicI32,
@@ -239,16 +296,49 @@ impl FingerprintHal {
             return Ok(instance.clone());
         }
 
-        Self::open()
+        let mut last_err = String::from("unknown");
+        for attempt in 1..=20 {
+            match Self::open() {
+                Ok(h) => {
+                    log_info!("FingerprintHal initialized successfully on attempt {}", attempt);
+                    return Ok(h);
+                }
+                Err(e) => {
+                    last_err = e.to_string();
+                    log_warn!(
+                        "FingerprintHal::open attempt {}/20 failed: {last_err} (retrying in 500ms...)",
+                        attempt
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                }
+            }
+        }
+        anyhow::bail!("FingerprintHal failed to initialize after 20 attempts: {last_err}")
     }
 
     fn open() -> anyhow::Result<Arc<Self>> {
-        // Goodix HAL candidate list for Transsion/Infinix devices
+        // Goodix devices commonly split the wrapper and implementation:
+        // libgf_hal.so is the implementation, while gf_fingerprint.default.so
+        // exports the legacy fingerprint HAL module. Preload the implementation
+        // globally so its symbols and dependencies resolve from /odm.
+        let goodix_impl_paths = [
+            "/odm/lib64/libgf_hal.so",
+            "/vendor/lib64/libgf_hal.so",
+        ];
+        let mut goodix_impl_handle: *mut libc::c_void = std::ptr::null_mut();
+        for path in goodix_impl_paths {
+            let c_path = CString::new(path).unwrap();
+            goodix_impl_handle = unsafe {
+                libc::dlopen(c_path.as_ptr(), libc::RTLD_NOW | libc::RTLD_GLOBAL)
+            };
+            if !goodix_impl_handle.is_null() {
+                log_info!("Preloaded Goodix implementation from {}", path);
+                break;
+            }
+        }
+
         let candidate_libs = [
             "/odm/lib64/hw/gf_fingerprint.default.so",
-            "/odm/lib64/libgf_hal.so",
-            "/vendor/lib64/hw/tran_fingerprint.default.so",
-            "/vendor/lib64/hw/fingerprint.goodix.default.so",
             "/vendor/lib64/hw/gf_fingerprint.default.so",
             "/odm/lib64/hw/fingerprint.default.so",
             "/system/lib64/hw/fingerprint.default.so",
@@ -308,6 +398,9 @@ impl FingerprintHal {
 
         let fp_dev = dev_ptr as *mut fingerprint_device_t;
         let fp_ref = unsafe { &mut *fp_dev };
+        let is_goodix = loaded_path.contains("gf_fingerprint")
+            || loaded_path == "/odm/lib64/libgf_hal.so"
+            || !goodix_impl_handle.is_null();
 
         log_info!(
             "Fingerprint HAL device opened successfully (tag=0x{:x}, ver=0x{:x})",
@@ -315,9 +408,21 @@ impl FingerprintHal {
             fp_ref.common.version
         );
 
-        // Goodix custom command: fingerprint_command(dev, cmd, arg)
+        // 1. Check for Silead custom command: silfp_finger_cust_cmd(cmd, arg)
+        let silead_sym = CString::new("silfp_finger_cust_cmd").unwrap();
+        let mut fn_silead_cmd: Option<FnSileadCustCmd> = unsafe {
+            let sym = libc::dlsym(handle, silead_sym.as_ptr());
+            if !sym.is_null() {
+                log_info!("Found Silead custom command symbol 'silfp_finger_cust_cmd'");
+                Some(std::mem::transmute(sym))
+            } else {
+                None
+            }
+        };
+
+        // 2. Check for Goodix custom command: fingerprint_command(dev, cmd, arg)
         let goodix_sym = CString::new("_Z19fingerprint_commandP18fingerprint_devicejj").unwrap();
-        let fn_goodix_cmd: Option<FnGoodixCustCmd> = unsafe {
+        let mut fn_goodix_cmd: Option<FnGoodixCustCmd> = unsafe {
             let sym = libc::dlsym(handle, goodix_sym.as_ptr());
             if !sym.is_null() {
                 log_info!("Found Goodix custom command symbol 'fingerprint_command'");
@@ -327,8 +432,138 @@ impl FingerprintHal {
             }
         };
 
+        if fn_goodix_cmd.is_none() && is_goodix {
+            let g = unsafe { &*(dev_ptr as *const goodix_fingerprint_device_t) };
+            if let Some(cmd_fn) = g.send_custom_cmd {
+                log_info!("Using Goodix device-struct send_custom_cmd at offset 0x110");
+                fn_goodix_cmd = Some(cmd_fn);
+            }
+        }
+
+        // 3. Resolve Silead optical worker symbols from handle or libsl_fp_impl.so
+        let sl_impl_path = CString::new("/vendor/lib64/libsl_fp_impl.so").unwrap();
+        let sl_impl_handle = unsafe { libc::dlopen(sl_impl_path.as_ptr(), libc::RTLD_NOW) };
+        if !sl_impl_handle.is_null() {
+            log_info!("dlopen(/vendor/lib64/libsl_fp_impl.so) succeeded");
+        } else {
+            log_warn!("dlopen(/vendor/lib64/libsl_fp_impl.so) returned null, using handle only");
+        }
+
+        let resolve_sym = |sym_name: &str| -> *mut libc::c_void {
+            let c_sym = CString::new(sym_name).unwrap();
+            let mut ptr = unsafe { libc::dlsym(handle, c_sym.as_ptr()) };
+            if ptr.is_null() && !sl_impl_handle.is_null() {
+                ptr = unsafe { libc::dlsym(sl_impl_handle, c_sym.as_ptr()) };
+            }
+            if ptr.is_null() && !goodix_impl_handle.is_null() {
+                ptr = unsafe { libc::dlsym(goodix_impl_handle, c_sym.as_ptr()) };
+            }
+            ptr
+        };
+
+        if fn_silead_cmd.is_none() {
+            let sym = resolve_sym("silfp_finger_cust_cmd");
+            if !sym.is_null() {
+                log_info!("Found silfp_finger_cust_cmd in implementation lib");
+                fn_silead_cmd = Some(unsafe { std::mem::transmute(sym) });
+            }
+        }
+
+        let fn_silfp_cust_init: Option<FnSilfpCustInit> = {
+            let sym = resolve_sym("silfp_finger_cust_init");
+            if !sym.is_null() {
+                log_info!("Found silfp_finger_cust_init");
+                Some(unsafe { std::mem::transmute(sym) })
+            } else {
+                None
+            }
+        };
+
+        let fn_silfp_sync_optic: Option<FnSilfpSyncOptic> = {
+            let sym = resolve_sym("silfp_impl_sync_finger_status_optic");
+            if !sym.is_null() {
+                log_info!("Found silfp_impl_sync_finger_status_optic");
+                Some(unsafe { std::mem::transmute(sym) })
+            } else {
+                None
+            }
+        };
+
+        let fn_silfp_sync_down: Option<FnSilfpSyncFinger> = {
+            let sym = resolve_sym("silfp_dev_sync_finger_down");
+            if !sym.is_null() {
+                log_info!("Found silfp_dev_sync_finger_down");
+                Some(unsafe { std::mem::transmute(sym) })
+            } else {
+                None
+            }
+        };
+
+        let fn_silfp_sync_up: Option<FnSilfpSyncFinger> = {
+            let sym = resolve_sym("silfp_dev_sync_finger_up");
+            if !sym.is_null() {
+                log_info!("Found silfp_dev_sync_finger_up");
+                Some(unsafe { std::mem::transmute(sym) })
+            } else {
+                None
+            }
+        };
+
+        let fn_silfp_msg_send: Option<FnSilfpMsgSend> = {
+            let sym = resolve_sym("silfp_msg_send");
+            if !sym.is_null() {
+                log_info!("Found silfp_msg_send");
+                Some(unsafe { std::mem::transmute(sym) })
+            } else {
+                None
+            }
+        };
+
+        type FnSilfpSetMode = unsafe extern "C" fn(mode: i32) -> libc::c_int;
+        let fn_silfp_set_mode: Option<FnSilfpSetMode> = {
+            let sym = resolve_sym("silfp_dev_set_finger_status_mode");
+            if !sym.is_null() {
+                log_info!("Found silfp_dev_set_finger_status_mode");
+                Some(unsafe { std::mem::transmute(sym) })
+            } else {
+                None
+            }
+        };
+
+        if let Some(set_mode) = fn_silfp_set_mode {
+            let ret = unsafe { set_mode(1) };
+            log_info!("silfp_dev_set_finger_status_mode(1) returned {}", ret);
+        }
+
+        if let Some(cust_init) = fn_silfp_cust_init {
+            let ret = unsafe { cust_init() };
+            log_info!("silfp_finger_cust_init() returned {}", ret);
+        }
+
+        let fn_silfp_worker_screen_state: Option<FnSilfpWorkerScreenState> = {
+            let sym = resolve_sym("silfp_worker_screen_state_callback");
+            if !sym.is_null() {
+                log_info!("Found silfp_worker_screen_state_callback");
+                Some(unsafe { std::mem::transmute(sym) })
+            } else {
+                let sym_def = resolve_sym("silfp_worker_set_screen_state_default");
+                if !sym_def.is_null() {
+                    log_info!("Found silfp_worker_set_screen_state_default");
+                    Some(unsafe { std::mem::transmute(sym_def) })
+                } else {
+                    None
+                }
+            }
+        };
+
+        if let Some(cb) = fn_silfp_worker_screen_state {
+            let ret = unsafe { cb(1) };
+            log_info!("Initial silfp_worker_screen_state_callback(1) returned {}", ret);
+        }
+
         let hal = Arc::new(Self {
             device: fp_dev,
+            is_goodix,
             current_callback: Arc::new(Mutex::new(None)),
             is_active: AtomicBool::new(false),
             is_finger_down: AtomicBool::new(false),
@@ -336,16 +571,28 @@ impl FingerprintHal {
             enumerated_ids: Mutex::new(Vec::new()),
             enum_completed: Arc::new(AtomicBool::new(false)),
             remove_pending: Arc::new(AtomicBool::new(false)),
+            fn_silead_cmd,
             fn_goodix_cmd,
+            fn_silfp_cust_init,
+            fn_silfp_sync_optic,
+            fn_silfp_sync_down,
+            fn_silfp_sync_up,
+            fn_silfp_msg_send,
+            fn_silfp_worker_screen_state,
             saved_enroll_fid: AtomicI32::new(0),
             step_captured: AtomicBool::new(false),
             screen_state: AtomicI32::new(1),
         });
 
         // Set up callback notification
-        if let Some(set_notify) = fp_ref.set_notify {
+        let set_notify = if is_goodix {
+            unsafe { (*(dev_ptr as *const goodix_fingerprint_device_t)).set_notify }
+        } else {
+            fp_ref.set_notify
+        };
+        if let Some(set_notify) = set_notify {
             let n_ret = unsafe { set_notify(fp_dev, hal_notify_trampoline) };
-            log_info!("fp_ref.set_notify returned {}", n_ret);
+            log_info!("set_notify returned {}", n_ret);
         }
 
         let _ = GLOBAL_HAL.set(hal.clone());
@@ -368,6 +615,15 @@ impl FingerprintHal {
 
     pub fn set_active_user(&self, user_id: i32, store_path: &str) {
         self.current_user_id.store(user_id, Ordering::SeqCst);
+        if self.is_goodix {
+            let dev = unsafe { &mut *(self.device as *mut goodix_fingerprint_device_t) };
+            if let Some(set_active_group) = dev.set_active_group {
+                let c_path = CString::new(store_path).unwrap_or_default();
+                let ret = unsafe { set_active_group(self.device, user_id as u32, c_path.as_ptr()) };
+                log_info!("[Goodix] set_active_group({}, '{}') returned {}", user_id, store_path, ret);
+            }
+            return;
+        }
         let dev = unsafe { &mut *self.device };
         if let Some(set_active_group) = dev.set_active_group {
             let c_path = CString::new(store_path).unwrap_or_default();
@@ -475,6 +731,13 @@ impl FingerprintHal {
     pub fn pre_enroll(&self) -> anyhow::Result<u64> {
         self.step_captured.store(false, Ordering::SeqCst);
         self.saved_enroll_fid.store(0, Ordering::SeqCst);
+        if self.is_goodix {
+            let dev = unsafe { &mut *(self.device as *mut goodix_fingerprint_device_t) };
+            let pre_enroll_fn = dev.pre_enroll.ok_or_else(|| anyhow::anyhow!("pre_enroll is null"))?;
+            let challenge = unsafe { pre_enroll_fn(self.device) };
+            log_info!("[Goodix] pre_enroll returned challenge: 0x{:x}", challenge);
+            return Ok(challenge);
+        }
         let dev = unsafe { &mut *self.device };
         let pre_enroll_fn = dev.pre_enroll.ok_or_else(|| anyhow::anyhow!("pre_enroll is null"))?;
         let challenge = unsafe { pre_enroll_fn(self.device) };
@@ -482,7 +745,15 @@ impl FingerprintHal {
         Ok(challenge)
     }
 
-    pub fn post_enroll(&self) {
+    pub fn post_enroll(&self, challenge: u64) {
+        if self.is_goodix {
+            let dev = unsafe { &mut *(self.device as *mut goodix_fingerprint_device_t) };
+            if let Some(post_enroll_fn) = dev.post_enroll {
+                let ret = unsafe { post_enroll_fn(self.device, challenge) };
+                log_info!("[Goodix] post_enroll(0x{:x}) returned {}", challenge, ret);
+            }
+            return;
+        }
         let dev = unsafe { &mut *self.device };
         if let Some(post_enroll_fn) = dev.post_enroll {
             let ret = unsafe { post_enroll_fn(self.device) };
@@ -494,6 +765,22 @@ impl FingerprintHal {
         self.step_captured.store(false, Ordering::SeqCst);
         self.saved_enroll_fid.store(0, Ordering::SeqCst);
         log_info!("FingerprintHal::enroll invoked");
+
+        if let Some(msg_send) = self.fn_silfp_msg_send {
+            unsafe { msg_send(3) }; // Ensure clean finger-up state in Silead message queue
+        }
+
+        if self.is_goodix {
+            let dev = unsafe { &mut *(self.device as *mut goodix_fingerprint_device_t) };
+            if let Some(enroll_fn) = dev.enroll {
+                self.is_active.store(true, Ordering::SeqCst);
+                let gid = self.current_user_id.load(Ordering::SeqCst) as u32;
+                let ret = unsafe { enroll_fn(self.device, hat as *const hw_auth_token_t, gid, timeout_sec) };
+                log_info!("[Goodix] dev.enroll invoked (gid={gid}), ret = {}", ret);
+                return ret;
+            }
+            return -1;
+        }
 
         let dev = unsafe { &mut *self.device };
         if let Some(enroll_fn) = dev.enroll {
@@ -508,6 +795,17 @@ impl FingerprintHal {
     }
 
     pub fn authenticate(&self, operation_id: u64) -> i32 {
+        if self.is_goodix {
+            let dev = unsafe { &mut *(self.device as *mut goodix_fingerprint_device_t) };
+            if let Some(auth_fn) = dev.authenticate {
+                self.is_active.store(true, Ordering::SeqCst);
+                let gid = self.current_user_id.load(Ordering::SeqCst) as u32;
+                let ret = unsafe { auth_fn(self.device, operation_id, gid) };
+                log_info!("[Goodix] authenticate invoked (op_id=0x{:x}, gid={gid}), ret = {}", operation_id, ret);
+                return ret;
+            }
+            return -1;
+        }
         let dev = unsafe { &mut *self.device };
         if let Some(auth_fn) = dev.authenticate {
             self.is_active.store(true, Ordering::SeqCst);
@@ -531,9 +829,18 @@ impl FingerprintHal {
         let old = self.screen_state.swap(state, Ordering::SeqCst);
         log_info!("FingerprintHal::set_screen_state transition: {} -> {}", old, state);
 
-        // Ensure HBM is deactivated and finger state reset across screen transitions
-        crate::hbm::set_hbm(false);
-        self.is_finger_down.store(false, Ordering::SeqCst);
+        // Notify Silead worker thread so its internal screen state ([0x6b23c]) matches hardware
+        if let Some(cb) = self.fn_silfp_worker_screen_state {
+            let vendor_state = if state == 0 { 0 } else { 1 };
+            let ret = unsafe { cb(vendor_state) };
+            log_info!("silfp_worker_screen_state_callback({}) returned {}", vendor_state, ret);
+        }
+
+        // Ensure HBM is deactivated and finger state reset when entering screen OFF
+        if state == 0 {
+            crate::hbm::set_hbm(false);
+            self.is_finger_down.store(false, Ordering::SeqCst);
+        }
 
         match state {
             0 => {
@@ -545,12 +852,12 @@ impl FingerprintHal {
                 // State 2: Dozing / Doze (AOD)
                 log_info!("[SleepState: DOZE] Screen reached Dozing/Doze (AOD). Maintaining touch & optical readiness.");
                 crate::input::ensure_gesture_fod_enabled();
-                self.send_custom_cmd(10, 1);
+                self.send_custom_cmd(10, 1, 0x10001, 1);
             }
             1 => {
                 // State 1: Awake (Screen ON)
                 log_info!("[SleepState: AWAKE] Screen is ON / active.");
-                self.send_custom_cmd(10, 1);
+                self.send_custom_cmd(10, 1, 0x10001, 1);
             }
             _ => {
                 log_info!("[SleepState: UNKNOWN] Received screen state {}", state);
@@ -569,13 +876,14 @@ impl FingerprintHal {
         }
     }
 
-    /// Sends a Goodix vendor command via `fingerprint_command(dev, cmd, arg)`.
-    /// Observed on-device: cmd 10 (0xa) and 11 (0xb) with arg 1 arm the sensor UI-ready/capture
-    /// path (logcat shows `updateUiReady` right after, capture starts within ~4ms).
-    pub fn send_custom_cmd(&self, cmd: u32, arg: u32) {
-        if let Some(cmd_fn) = self.fn_goodix_cmd {
+    pub fn send_custom_cmd(&self, silead_cmd: u32, silead_arg: u32, goodix_cmd: u32, goodix_arg: u32) {
+        if let Some(cmd_fn) = self.fn_silead_cmd {
             unsafe {
-                let _ = cmd_fn(self.device, cmd, arg);
+                let _ = cmd_fn(silead_cmd, silead_arg);
+            }
+        } else if let Some(cmd_fn) = self.fn_goodix_cmd {
+            unsafe {
+                let _ = cmd_fn(self.device, goodix_cmd, goodix_arg);
             }
         }
     }
@@ -587,24 +895,46 @@ impl FingerprintHal {
         if _was_down {
             self.notify_framework_touch(false);
         }
-        self.send_custom_cmd(10, 0);
-        self.send_custom_cmd(11, 0);
-        let dev = unsafe { &mut *self.device };
-        if let Some(cancel_fn) = dev.cancel {
-            let ret = unsafe { cancel_fn(self.device) };
-            log_info!("cancel invoked, ret = {}", ret);
+        self.send_custom_cmd(10, 0, 0x10001, 0);
+        self.send_custom_cmd(11, 0, 0x10001, 0);
+        if let Some(sync_optic) = self.fn_silfp_sync_optic {
+            unsafe { sync_optic(0) };
+        } else if let Some(msg_send) = self.fn_silfp_msg_send {
+            unsafe { msg_send(3) };
+        }
+        if self.is_goodix {
+            let dev = unsafe { &mut *(self.device as *mut goodix_fingerprint_device_t) };
+            if let Some(cancel_fn) = dev.cancel {
+                let ret = unsafe { cancel_fn(self.device) };
+                log_info!("[Goodix] cancel invoked, ret = {}", ret);
+            }
+        } else {
+            let dev = unsafe { &mut *self.device };
+            if let Some(cancel_fn) = dev.cancel {
+                let ret = unsafe { cancel_fn(self.device) };
+                log_info!("cancel invoked, ret = {}", ret);
+            }
         }
         self.is_active.store(false, Ordering::SeqCst);
     }
 
     pub fn enumerate(&self) {
-        let dev = unsafe { &mut *self.device };
         self.enumerated_ids.lock().clear();
         self.enum_completed.store(false, Ordering::SeqCst);
-        let ret = if let Some(enum_fn) = dev.enumerate {
-            unsafe { enum_fn(self.device) }
+        let ret = if self.is_goodix {
+            let dev = unsafe { &mut *(self.device as *mut goodix_fingerprint_device_t) };
+            if let Some(enum_fn) = dev.enumerate {
+                unsafe { enum_fn(self.device) }
+            } else {
+                -1
+            }
         } else {
-            -1
+            let dev = unsafe { &mut *self.device };
+            if let Some(enum_fn) = dev.enumerate {
+                unsafe { enum_fn(self.device) }
+            } else {
+                -1
+            }
         };
         log_info!("enumerate invoked, ret = {}", ret);
 
@@ -630,6 +960,22 @@ impl FingerprintHal {
 
     pub fn remove(&self, finger_id: u32) {
         self.remove_pending.store(true, Ordering::SeqCst);
+        if self.is_goodix {
+            let dev = unsafe { &mut *(self.device as *mut goodix_fingerprint_device_t) };
+            if let Some(remove_fn) = dev.remove {
+                let ids = [finger_id];
+                let ret = unsafe { remove_fn(self.device, ids.as_ptr(), 1) };
+                log_info!("[Goodix] remove(fid={}) invoked, ret = {}", finger_id, ret);
+                if ret == 0 {
+                    self.remove_pending.store(false, Ordering::SeqCst);
+                    if let Some(cb) = self.current_callback.lock().as_ref() {
+                        log_info!("[Goodix] reporting requested removal fid {}", finger_id);
+                        let _ = cb.onEnrollmentsRemoved(&[finger_id as i32]);
+                    }
+                }
+            }
+            return;
+        }
         let dev = unsafe { &mut *self.device };
         let gid = self.current_user_id.load(Ordering::SeqCst) as u32;
         if let Some(remove_fn) = dev.remove {
@@ -662,11 +1008,12 @@ impl FingerprintHal {
         let screen_state = self.get_screen_state();
 
         if !self.is_active() {
-            log_debug!(
-                "on_pointer_down received while session inactive (screen_state={}) -> ignored",
-                screen_state
-            );
-            return;
+            if screen_state == 1 {
+                log_debug!("on_pointer_down while inactive and screen is ON -> ignored");
+                return;
+            }
+            log_info!("on_pointer_down while inactive (screen_state={}) -> auto-starting authenticate for SOFOD", screen_state);
+            self.authenticate(0);
         }
 
         if self.is_finger_down.swap(true, Ordering::SeqCst) {
@@ -694,9 +1041,9 @@ impl FingerprintHal {
         }
 
         // 3. Activate hardware HBM backlight and synchronize until panel confirms active (0xOK)
-        let hbm_ok = crate::hbm::set_hbm_sync(true, crate::hbm::HBM_SETTLE_MS);
+        let hbm_ok = crate::hbm::set_hbm_sync(true, 500);
         if !hbm_ok {
-            log_warn!("Hardware LCM HBM write failed, proceeding with capture anyway");
+            log_warn!("Hardware LCM HBM did not confirm 0xOK within 500ms, proceeding with capture fallback");
         }
 
         // If finger was lifted during HBM synchronization, abort capture
@@ -712,9 +1059,9 @@ impl FingerprintHal {
         // Fast settling delay (5ms) for CMOS exposure uniformity aligned with ColorOS animation flare
         std::thread::sleep(std::time::Duration::from_millis(5));
 
-        // Re-check if finger was lifted or session became inactive during settling delay
-        if !self.is_finger_down.load(Ordering::SeqCst) || !self.is_active() {
-            log_info!("Finger lifted or session inactive during settling delay, aborting capture");
+        // Re-check if finger was lifted during settling delay
+        if !self.is_finger_down.load(Ordering::SeqCst) {
+            log_info!("Finger lifted during settling delay, aborting capture");
             crate::hbm::set_hbm(false);
             if self.get_screen_state() == 0 {
                 crate::input::release_wakelock("oplus_udfps_fod_wake");
@@ -723,9 +1070,16 @@ impl FingerprintHal {
         }
 
         // 5. Wake vendor sensor and start optical capture
-        self.send_custom_cmd(10, 1);
-        self.send_custom_cmd(11, 1);
+        self.send_custom_cmd(10, 1, 0x10001, 1);
+        self.send_custom_cmd(11, 1, 0x10001, 1);
 
+        if let Some(sync_optic) = self.fn_silfp_sync_optic {
+            unsafe { sync_optic(1) };
+        } else if let Some(sync_down) = self.fn_silfp_sync_down {
+            unsafe { sync_down() };
+        } else if let Some(msg_send) = self.fn_silfp_msg_send {
+            unsafe { msg_send(2) }; // FINGER_DOWN = 2
+        }
     }
 
     pub fn on_pointer_up(&self) {
@@ -737,8 +1091,15 @@ impl FingerprintHal {
         crate::hbm::set_hbm(false);
 
         // Inform vendor sensor of finger lift
-        self.send_custom_cmd(11, 0);
+        self.send_custom_cmd(11, 0, 0x10001, 0);
 
+        if let Some(sync_optic) = self.fn_silfp_sync_optic {
+            unsafe { sync_optic(0) };
+        } else if let Some(sync_up) = self.fn_silfp_sync_up {
+            unsafe { sync_up() };
+        } else if let Some(msg_send) = self.fn_silfp_msg_send {
+            unsafe { msg_send(3) }; // FINGER_UP = 3
+        }
 
         // Notify ColorOS framework of touch up via binder transact 1001 (cmd 1202)
         // This triggers dispatchTouchUp() -> SystemUI reason 9 -> stops pressed animation!
@@ -750,7 +1111,7 @@ impl FingerprintHal {
 
     pub fn on_ui_ready(&self) {
         log_info!("on_ui_ready received from framework -> notifying vendor HAL icon ready");
-        self.send_custom_cmd(10, 1);
+        self.send_custom_cmd(10, 1, 0x10001, 1);
     }
 
     // Internal notification dispatcher from C trampoline
@@ -766,9 +1127,22 @@ impl FingerprintHal {
 
         match msg.r#type {
             FINGERPRINT_AUTHENTICATED => {
-                let auth_data = unsafe { &*(msg.data.as_ptr() as *const fingerprint_authenticated_t) };
-                let fid = auth_data.finger.fid as i32;
-                self.send_custom_cmd(11, 0);
+                let (fid, hat) = if self.is_goodix {
+                    let p = msg.data.as_ptr();
+                    let fid = unsafe { *(p as *const u32) } as i32;
+                    let hat = unsafe { &*((p.add(4)) as *const hw_auth_token_t) };
+                    (fid, hat.to_aidl())
+                } else {
+                    let auth_data = unsafe { &*(msg.data.as_ptr() as *const fingerprint_authenticated_t) };
+                    (auth_data.finger.fid as i32, auth_data.hat.to_aidl())
+                };
+
+                self.send_custom_cmd(11, 0, 0x10001, 0);
+                if let Some(sync_optic) = self.fn_silfp_sync_optic {
+                    unsafe { sync_optic(0) };
+                } else if let Some(msg_send) = self.fn_silfp_msg_send {
+                    unsafe { msg_send(3) };
+                }
 
                 // Immediately extinguish HBM backlight!
                 // Optical capture and matching are completed. We must not leave HBM active
@@ -778,10 +1152,13 @@ impl FingerprintHal {
 
                 if fid != 0 {
                     self.is_active.store(false, Ordering::SeqCst);
-                    self.send_custom_cmd(10, 0);
-                    let hat = auth_data.hat.to_aidl();
+                    self.send_custom_cmd(10, 0, 0x10001, 0);
                     log_info!("Authentication SUCCEEDED for fid {}", fid);
                     let _ = cb.onAuthenticationSucceeded(fid, &hat);
+                    if self.get_screen_state() == 0 && !Self::is_display_dpms_on() {
+                        log_info!("SOFOD authentication succeeded while display was fully asleep. Waking display pipeline");
+                        crate::input::wake_display_pipeline();
+                    }
                 } else {
                     log_info!("Authentication FAILED (unrecognized finger, keeping session active for next touch)");
                     let _ = cb.onAuthenticationFailed();
@@ -798,9 +1175,9 @@ impl FingerprintHal {
                     FINGERPRINT_ACQUIRED_TOO_FAST => (AcquiredInfo::TOO_FAST, 0),
                     FINGERPRINT_ACQUIRED_VENDOR => (AcquiredInfo::VENDOR, 0),
                     1001 | 1002 | 1020 => {
-                        // Suppress Goodix vendor-internal signals from framework logcat
+                        // Suppress Silead internal hardware signals from framework logcat
                         // (1001 = down, 1002 = up, 1020 = wait ui ready)
-                        log_debug!("Goodix vendor acquired event: {}", acq_data.acquired_info);
+                        log_debug!("Silead internal acquired event: {}", acq_data.acquired_info);
                         return;
                     }
                     other => (AcquiredInfo::VENDOR, other),
@@ -808,33 +1185,36 @@ impl FingerprintHal {
                 let _ = cb.onAcquired(info, vendor_code);
             }
             FINGERPRINT_TEMPLATE_ENROLLING => {
-                let enroll_data = unsafe { &*(msg.data.as_ptr() as *const fingerprint_enroll_t) };
-                let raw_fid = enroll_data.finger.fid as i32;
-                let raw_remaining = enroll_data.samples_remaining as i32;
+                let (raw_fid, raw_remaining) = if self.is_goodix {
+                    let p = msg.data.as_ptr() as *const u32;
+                    let fid = unsafe { *p } as i32;
+                    let remaining = unsafe { *p.add(1) } as i32;
+                    (fid, remaining)
+                } else {
+                    let enroll_data = unsafe { &*(msg.data.as_ptr() as *const fingerprint_enroll_t) };
+                    (enroll_data.finger.fid as i32, enroll_data.samples_remaining as i32)
+                };
 
-                if self.step_captured.swap(true, Ordering::SeqCst) {
+                if !self.is_goodix && self.step_captured.swap(true, Ordering::SeqCst) {
                     log_debug!("Duplicate enroll step during same touch ignored (raw_remaining={})", raw_remaining);
                     return;
                 }
 
-                log_info!("Enroll progress from Goodix HAL: raw_fid {}, raw_remaining {}", raw_fid, raw_remaining);
-                {
-                    // Diagnostic: raw dump of the vendor enroll struct (first 32 bytes as u32 words)
-                    let w: Vec<u32> = msg.data[..32]
-                        .chunks_exact(4)
-                        .map(|c| u32::from_ne_bytes([c[0], c[1], c[2], c[3]]))
-                        .collect();
-                    log_info!("Enroll raw words: {:08x?}", w);
-                }
+                log_info!("Enroll progress: raw_fid {}, raw_remaining {}", raw_fid, raw_remaining);
 
                 if raw_fid != 0 {
                     self.saved_enroll_fid.store(raw_fid, Ordering::SeqCst);
                 }
 
-                // Disarm capture for this touch so Goodix does not burst multiple captures
-                self.send_custom_cmd(11, 0);
+                // Disarm capture for this touch so Silead does not burst multiple captures
+                self.send_custom_cmd(11, 0, 0x10001, 0);
+                if let Some(sync_optic) = self.fn_silfp_sync_optic {
+                    unsafe { sync_optic(0) };
+                } else if let Some(msg_send) = self.fn_silfp_msg_send {
+                    unsafe { msg_send(3) };
+                }
 
-                // Extinguish HBM backlight for this enroll capture step
+                // Turn off HBM after sample capture to prompt user to lift and press again
                 crate::hbm::set_hbm(false);
                 self.is_finger_down.store(false, Ordering::SeqCst);
 
@@ -848,27 +1228,46 @@ impl FingerprintHal {
                         1
                     }
                 } else {
-                    0
+                    raw_fid
                 };
 
                 log_info!("Reporting enrollment progress: fid {}, remaining {}", fid, raw_remaining);
                 let _ = cb.onEnrollmentProgress(fid, raw_remaining);
 
-                // NOTE: Goodix reports raw_remaining == 0 on the very first step (increase_rate=0),
-                // so it is NOT treated as end-of-enroll here. The session stays active until the
-                // framework cancels it; check "Enroll raw words" in the log for the real semantics.
+                if raw_remaining == 0 {
+                    log_info!("Enrollment completed successfully (final fid {})", fid);
+                    self.is_active.store(false, Ordering::SeqCst);
+                    self.send_custom_cmd(10, 0, 0x10001, 0);
+                }
             }
             FINGERPRINT_TEMPLATE_REMOVED => {
-                let rem_data = unsafe { &*(msg.data.as_ptr() as *const fingerprint_removed_t) };
-                let fid = rem_data.finger.fid as i32;
+                let (gid, fid) = if self.is_goodix {
+                    let p = msg.data.as_ptr() as *const u32;
+                    let gid = unsafe { *p } as i32;
+                    let fid = unsafe { *p.add(1) } as i32;
+                    (gid, fid)
+                } else {
+                    let rem_data = unsafe { &*(msg.data.as_ptr() as *const fingerprint_removed_t) };
+                    (rem_data.finger.gid as i32, rem_data.finger.fid as i32)
+                };
                 self.remove_pending.store(false, Ordering::SeqCst);
-                log_info!("Enrollment removed via vendor callback: fid {}", fid);
+                log_info!("Enrollment removed via vendor callback: gid {}, fid {}", gid, fid);
+                if fid == 0 {
+                    log_warn!("Ignoring vendor removal callback with fid 0; requested fid was already reported");
+                    return;
+                }
                 let _ = cb.onEnrollmentsRemoved(&[fid]);
             }
             FINGERPRINT_TEMPLATE_ENUMERATING => {
-                let enum_data = unsafe { &*(msg.data.as_ptr() as *const fingerprint_enroll_t) };
-                let fid = enum_data.finger.fid as i32;
-                let remaining = enum_data.samples_remaining as usize;
+                let (fid, remaining) = if self.is_goodix {
+                    let p = msg.data.as_ptr() as *const u32;
+                    let fid = unsafe { *p } as i32;
+                    let remaining = unsafe { *p.add(1) } as usize;
+                    (fid, remaining)
+                } else {
+                    let enum_data = unsafe { &*(msg.data.as_ptr() as *const fingerprint_enroll_t) };
+                    (enum_data.finger.fid as i32, enum_data.samples_remaining as usize)
+                };
 
                 let mut list = self.enumerated_ids.lock();
                 if fid != 0 {
@@ -885,8 +1284,8 @@ impl FingerprintHal {
                 self.is_finger_down.store(false, Ordering::SeqCst);
                 crate::hbm::set_hbm(false);
                 self.is_active.store(false, Ordering::SeqCst);
-                self.send_custom_cmd(10, 0);
-                self.send_custom_cmd(11, 0);
+                self.send_custom_cmd(10, 0, 0x10001, 0);
+                self.send_custom_cmd(11, 0, 0x10001, 0);
 
                 let (err, vendor_code) = match err_code {
                     FINGERPRINT_ERROR_HW_UNAVAILABLE => (Error::HW_UNAVAILABLE, 0),
