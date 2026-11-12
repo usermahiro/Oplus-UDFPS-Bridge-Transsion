@@ -1,7 +1,7 @@
 #![allow(non_camel_case_types)]
 
 use std::ffi::{CStr, CString};
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock};
 use parking_lot::Mutex;
 use rsbinder::Strong;
@@ -12,6 +12,15 @@ use crate::android::hardware::biometrics::fingerprint::ISessionCallback::ISessio
 use crate::android::hardware::keymaster::HardwareAuthToken::HardwareAuthToken;
 use crate::android::hardware::keymaster::Timestamp::Timestamp;
 use crate::{log_debug, log_info, log_warn};
+
+/// Jeda setelah sample enroll sebelum capture berikutnya (biar animasi progress sempat jalan)
+const HOLD_ENROLL_REARM_MS: u64 = 450;
+/// Jeda sebelum retry auth saat jari masih menempel
+const HOLD_AUTH_REARM_MS: u64 = 350;
+/// Maks retry auth otomatis per sentuhan (Android lockout setelah 5 gagal)
+const HOLD_AUTH_REARM_MAX: u32 = 3;
+/// Lama "jari terangkat" palsu antara HBM off dan on
+const HOLD_FAKE_UP_MS: u64 = 80;
 
 pub const HARDWARE_MODULE_TAG: u32 = 0x48574D54; // 'HWMT'
 
@@ -266,6 +275,12 @@ pub struct FingerprintHal {
     fn_silfp_worker_screen_state: Option<FnSilfpWorkerScreenState>,
     saved_enroll_fid: AtomicI32,
     step_captured: AtomicBool,
+    /// Jari fisik masih menempel di sensor (di-set pointer_down, di-clear pointer_up/cancel)
+    finger_held: AtomicBool,
+    /// Generasi rearm; dinaikkan tiap pointer_up/cancel supaya rearm yang tertunda batal
+    rearm_gen: AtomicU32,
+    /// Jumlah rearm auth berturut-turut dalam satu sentuhan (batasi biar tidak lockout)
+    auth_rearm_count: AtomicU32,
     pub screen_state: AtomicI32,
 }
 
@@ -581,6 +596,9 @@ impl FingerprintHal {
             fn_silfp_worker_screen_state,
             saved_enroll_fid: AtomicI32::new(0),
             step_captured: AtomicBool::new(false),
+            finger_held: AtomicBool::new(false),
+            rearm_gen: AtomicU32::new(0),
+            auth_rearm_count: AtomicU32::new(0),
             screen_state: AtomicI32::new(1),
         });
 
@@ -890,6 +908,8 @@ impl FingerprintHal {
 
     pub fn cancel(&self) {
         let _was_down = self.is_finger_down.swap(false, Ordering::SeqCst);
+        self.finger_held.store(false, Ordering::SeqCst);
+        self.rearm_gen.fetch_add(1, Ordering::SeqCst);
         self.step_captured.store(false, Ordering::SeqCst);
         crate::hbm::set_hbm(false);
         if _was_down {
@@ -1016,11 +1036,13 @@ impl FingerprintHal {
             self.authenticate(0);
         }
 
+        self.finger_held.store(true, Ordering::SeqCst);
         if self.is_finger_down.swap(true, Ordering::SeqCst) {
             log_debug!("Duplicate pointer_down ignored");
             return;
         }
         self.step_captured.store(false, Ordering::SeqCst);
+        self.auth_rearm_count.store(0, Ordering::SeqCst);
         log_info!(
             "on_pointer_down at ({}, {}) (screen_state={}) -> activating HBM & optical capture",
             x, y, screen_state
@@ -1084,6 +1106,8 @@ impl FingerprintHal {
 
     pub fn on_pointer_up(&self) {
         let was_down = self.is_finger_down.swap(false, Ordering::SeqCst);
+        self.finger_held.store(false, Ordering::SeqCst);
+        self.rearm_gen.fetch_add(1, Ordering::SeqCst);
         self.step_captured.store(false, Ordering::SeqCst);
         log_info!("on_pointer_up (was_down={}, is_active={}) -> deactivating HBM", was_down, self.is_active());
 
@@ -1107,6 +1131,84 @@ impl FingerprintHal {
 
         // Release FOD wake lock
         crate::input::release_wakelock("oplus_udfps_fod_wake");
+    }
+
+    /// Jadwalkan capture ulang selama jari fisik masih menempel.
+    /// Dibatalkan otomatis oleh on_pointer_up()/cancel()/sukses auth (rearm_gen naik).
+    fn schedule_hold_rearm(&self, delay_ms: u64) {
+        if !self.finger_held.load(Ordering::SeqCst) || !self.is_active() {
+            return;
+        }
+        let gen = self.rearm_gen.fetch_add(1, Ordering::SeqCst) + 1;
+        let hal = match GLOBAL_HAL.get() {
+            Some(h) => h.clone(),
+            None => return,
+        };
+        let spawned = std::thread::Builder::new()
+            .name("fod_hold_rearm".to_string())
+            .spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                if hal.rearm_gen.load(Ordering::SeqCst) != gen {
+                    return;
+                }
+                hal.rearm_capture(gen);
+            });
+        if let Err(e) = spawned {
+            log_warn!("Hold-rearm: failed to spawn thread: {e}");
+        }
+    }
+
+    /// Simulasi "angkat lalu tekan lagi" ke vendor HAL tanpa mengubah state UI framework
+    /// (pressed icon tetap tampil, tidak ada notify touch up/down ke SystemUI).
+    fn rearm_capture(&self, gen: u32) {
+        let still = |s: &Self| {
+            s.finger_held.load(Ordering::SeqCst)
+                && s.is_active()
+                && s.rearm_gen.load(Ordering::SeqCst) == gen
+        };
+        if !still(self) {
+            return;
+        }
+        log_info!("Hold-rearm: finger still held -> re-triggering capture (HBM cycle)");
+
+        // fake lift: HBM off + disarm vendor capture
+        crate::hbm::set_hbm(false);
+        self.send_custom_cmd(11, 0, 0x10001, 0);
+        if let Some(sync_optic) = self.fn_silfp_sync_optic {
+            unsafe { sync_optic(0) };
+        } else if let Some(msg_send) = self.fn_silfp_msg_send {
+            unsafe { msg_send(3) };
+        }
+        std::thread::sleep(std::time::Duration::from_millis(HOLD_FAKE_UP_MS));
+        if !still(self) {
+            return;
+        }
+
+        // fake press: HBM on (kernel kirim uevent FULL_HBM_SET -> HAL Goodix capture) + arm
+        self.is_finger_down.store(true, Ordering::SeqCst);
+        self.step_captured.store(false, Ordering::SeqCst);
+        if !crate::hbm::set_hbm_sync(true, 500) {
+            log_warn!("Hold-rearm: HBM did not confirm within 500ms, continuing");
+        }
+        if !still(self) {
+            crate::hbm::set_hbm(false);
+            self.is_finger_down.store(false, Ordering::SeqCst);
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        self.send_custom_cmd(10, 1, 0x10001, 1);
+        self.send_custom_cmd(11, 1, 0x10001, 1);
+        if let Some(sync_optic) = self.fn_silfp_sync_optic {
+            unsafe { sync_optic(1) };
+        } else if let Some(sync_down) = self.fn_silfp_sync_down {
+            unsafe { sync_down() };
+        } else if let Some(msg_send) = self.fn_silfp_msg_send {
+            unsafe { msg_send(2) };
+        }
+    }
+
+    pub fn is_finger_held(&self) -> bool {
+        self.finger_held.load(Ordering::SeqCst)
     }
 
     pub fn on_ui_ready(&self) {
@@ -1153,6 +1255,7 @@ impl FingerprintHal {
                 if fid != 0 {
                     self.is_active.store(false, Ordering::SeqCst);
                     self.send_custom_cmd(10, 0, 0x10001, 0);
+                    self.rearm_gen.fetch_add(1, Ordering::SeqCst);
                     log_info!("Authentication SUCCEEDED for fid {}", fid);
                     let _ = cb.onAuthenticationSucceeded(fid, &hat);
                     if self.get_screen_state() == 0 && !Self::is_display_dpms_on() {
@@ -1162,6 +1265,13 @@ impl FingerprintHal {
                 } else {
                     log_info!("Authentication FAILED (unrecognized finger, keeping session active for next touch)");
                     let _ = cb.onAuthenticationFailed();
+                    // Jari masih ditekan -> coba capture lagi tanpa perlu angkat jari (dibatasi)
+                    let n = self.auth_rearm_count.fetch_add(1, Ordering::SeqCst) + 1;
+                    if n <= HOLD_AUTH_REARM_MAX {
+                        self.schedule_hold_rearm(HOLD_AUTH_REARM_MS);
+                    } else {
+                        log_info!("Hold-rearm: auth retry cap ({}) reached, waiting for finger lift", HOLD_AUTH_REARM_MAX);
+                    }
                 }
             }
             FINGERPRINT_ACQUIRED => {
@@ -1233,6 +1343,12 @@ impl FingerprintHal {
 
                 log_info!("Reporting enrollment progress: fid {}, remaining {}", fid, raw_remaining);
                 let _ = cb.onEnrollmentProgress(fid, raw_remaining);
+                if raw_remaining > 0 {
+                    // Jari masih ditekan -> lanjut sample berikutnya otomatis (spam enroll)
+                    self.schedule_hold_rearm(HOLD_ENROLL_REARM_MS);
+                } else {
+                    self.rearm_gen.fetch_add(1, Ordering::SeqCst);
+                }
 
                 if raw_remaining == 0 {
                     log_info!("Enrollment completed successfully (final fid {})", fid);

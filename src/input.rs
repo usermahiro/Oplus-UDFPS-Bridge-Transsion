@@ -805,8 +805,10 @@ pub fn start_screen_off_touch_monitor(hal: Arc<crate::hal::FingerprintHal>) {
                     }
 
                     // Watchdog: prevent HBM from ever being stuck on (> 1500ms)
-                    if is_down && last_down_time.elapsed() >= std::time::Duration::from_millis(1500) {
-                        log_warn!("Watchdog: FOD touch timed out (1500ms) -> forcing HBM off");
+                    // Selama sesi auth/enroll aktif dan jari masih menempel (hold-rearm), beri waktu lebih panjang.
+                    let wd_ms = if hal.is_active() && hal.is_finger_held() { 12000 } else { 1500 };
+                    if is_down && last_down_time.elapsed() >= std::time::Duration::from_millis(wd_ms) {
+                        log_warn!("Watchdog: FOD touch timed out ({}ms) -> forcing HBM off", wd_ms);
                         is_down = false;
                         hal.on_pointer_up();
                         release_wakelock("oplus_udfps_fod_wake");
