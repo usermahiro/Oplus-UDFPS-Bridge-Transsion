@@ -378,3 +378,26 @@ Confirm that the SystemUI animation window has valid dimensions (`500x500` rathe
 adb shell "dumpsys window windows | grep -A 10 'OnScreenFingerprintPressedIcon'"
 ```
 The output should report `Requested w=500 h=500`.
+
+
+---
+
+## Goodix finger-down trigger, SOFOD & hold-rearm
+
+- Goodix `gfFingerTouchEventDetectingThread` reads the touchscreen evdev (`/dev/input/eventN`, `mtk-tpd`) directly:
+  `EV_KEY 0x00C3` value 1 = FINGER_DOWN, value 0 = FINGER_UP. This is the only capture trigger.
+- **SOFOD (screen off)**: the kernel sends `0xC3 DOWN` on the first touch, before the authenticate session exists, and the
+  TP sends `0xC3 UP` ~250 ms later while the finger is still held. After wake the bridge therefore injects
+  `0xC3 DOWN` (and `UP` at the end) itself, so no second touch is needed.
+- **Hold-rearm**: while the finger is still held, enroll steps (450 ms apart) and failed auth (350 ms, max 3) re-trigger
+  capture by injecting `0xC3 UP` then `0xC3 DOWN`. Cancelled by finger lift / cancel / auth success.
+- Optional SOFOD tuning file (seconds), read on every refire, no restart needed:
+
+  ```text
+  # /data/addon/fod/sofod_touch.conf
+  DELAY=0.02
+  HOLD=1.0
+  ```
+
+- SELinux (needed once enforcing): `hal_fingerprint_default` needs `write` on `input_device:chr_file`
+  and `capability2 block_suspend`.

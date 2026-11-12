@@ -23,7 +23,7 @@ pub const SYN_REPORT: u16 = 0;
 
 pub const SOFOD_TID: i32 = 900;
 pub const SOFOD_MAJOR: i32 = 80;
-pub const SOFOD_DELAY_MS: u64 = 200;
+pub const SOFOD_DELAY_MS: u64 = 20;
 pub const SOFOD_HOLD_MS: u64 = 1000;
 
 // Calibrated Optical FOD Sensor Location & Touch Target for Transsion Camon 30 Pro (1080x2436)
@@ -444,7 +444,7 @@ impl Default for SofodConfig {
 
 pub fn load_sofod_config() -> SofodConfig {
     let mut cfg = SofodConfig::default();
-    if let Ok(content) = std::fs::read_to_string("/data/adb/fod/sofod_touch.conf") {
+    if let Ok(content) = std::fs::read_to_string("/data/addon/fod/sofod_touch.conf") {
         for line in content.lines() {
             let line = line.trim();
             if line.starts_with('#') || line.is_empty() {
@@ -480,6 +480,49 @@ pub fn load_sofod_config() -> SofodConfig {
         }
     }
     cfg
+}
+
+/// Jendela "diam": event KEY 0xC3 hasil injeksi kita sendiri jangan diproses ulang oleh monitor.
+static INJECT_QUIET: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+
+pub fn mark_fod_key_injection() {
+    *INJECT_QUIET.lock() = Some(std::time::Instant::now() + std::time::Duration::from_millis(200));
+}
+
+pub fn fod_key_injection_quiet() -> bool {
+    match *INJECT_QUIET.lock() {
+        Some(t) => std::time::Instant::now() < t,
+        None => false,
+    }
+}
+
+/// Inject EV_KEY 0x00C3 (value 1 = down, 0 = up) ke touchscreen.
+/// Goodix HAL (gfFingerTouchEventDetectingThread) membaca langsung event ini dari /dev/input/eventN:
+/// KEY 0xC3 value 1 = FINGER_DOWN, value 0 = FINGER_UP. Ini satu-satunya trigger capture-nya.
+pub fn inject_fod_key(value: i32) -> bool {
+    let dev_path = match find_touchscreen_device() {
+        Some(p) => p,
+        None => {
+            log_warn!("inject_fod_key: touchscreen device not found");
+            return false;
+        }
+    };
+    match OpenOptions::new().write(true).open(&dev_path) {
+        Ok(mut dev) => {
+            mark_fod_key_injection();
+            let ev = [
+                InputEvent::new(EV_KEY, FOD_KEYCODE, value),
+                InputEvent::new(EV_SYN, SYN_REPORT, 0),
+            ];
+            let ok = write_input_events(&mut dev, &ev).is_ok();
+            log_info!("inject_fod_key({}) -> {} (ok={})", value, dev_path, ok);
+            ok
+        }
+        Err(e) => {
+            log_warn!("inject_fod_key: open {} failed: {e}", dev_path);
+            false
+        }
+    }
 }
 
 pub fn refire_sofod_touch(px: i32, py: i32, default_path: &str) {
@@ -534,6 +577,16 @@ pub fn refire_sofod_touch(px: i32, py: i32, default_path: &str) {
             ];
             let _ = write_input_events(&mut dev, &down_events);
 
+            // Goodix HAL hanya capture saat melihat KEY 0xC3 DOWN. Kernel sudah mengirimnya saat
+            // sentuhan pertama (layar mati), tapi saat itu sesi authenticate belum aktif -> hilang.
+            mark_fod_key_injection();
+            let key_down = [
+                InputEvent::new(EV_KEY, FOD_KEYCODE, 1),
+                InputEvent::new(EV_SYN, SYN_REPORT, 0),
+            ];
+            let _ = write_input_events(&mut dev, &key_down);
+            log_info!("SOFOD refire: inject KEY 0x{:x} DOWN (trigger Goodix capture)", FOD_KEYCODE);
+
             let start = std::time::Instant::now();
             let hold_dur = std::time::Duration::from_millis(cfg.hold_ms);
             while start.elapsed() < hold_dur {
@@ -552,6 +605,12 @@ pub fn refire_sofod_touch(px: i32, py: i32, default_path: &str) {
                 InputEvent::new(EV_SYN, SYN_REPORT, 0),
             ];
             let _ = write_input_events(&mut dev, &up_events);
+            mark_fod_key_injection();
+            let key_up = [
+                InputEvent::new(EV_KEY, FOD_KEYCODE, 0),
+                InputEvent::new(EV_SYN, SYN_REPORT, 0),
+            ];
+            let _ = write_input_events(&mut dev, &key_up);
 
             SOFOD_REFIRE_BUSY.store(false, std::sync::atomic::Ordering::SeqCst);
         })
@@ -619,6 +678,9 @@ pub fn start_screen_off_touch_monitor(hal: Arc<crate::hal::FingerprintHal>) {
                                         )
                                     };
 
+                                    if event.type_ == EV_KEY && event.code == FOD_KEYCODE && fod_key_injection_quiet() {
+                                        continue; // event KEY 0xC3 dari injeksi kita sendiri
+                                    }
                                     if event.type_ == EV_ABS {
                                         if event.code == ABS_MT_POSITION_X {
                                             cur_x = if event.value > 1080 { event.value / 16 } else { event.value };

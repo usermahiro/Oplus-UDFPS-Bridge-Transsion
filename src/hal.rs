@@ -1169,9 +1169,10 @@ impl FingerprintHal {
         if !still(self) {
             return;
         }
-        log_info!("Hold-rearm: finger still held -> re-triggering capture (HBM cycle)");
+        log_info!("Hold-rearm: finger still held -> re-triggering capture (KEY 0xC3 up/down)");
 
-        // fake lift: HBM off + disarm vendor capture
+        // fake lift: KEY 0xC3 UP ke touchscreen (ini yang dibaca Goodix HAL sebagai FINGER_UP)
+        crate::input::inject_fod_key(0);
         crate::hbm::set_hbm(false);
         self.send_custom_cmd(11, 0, 0x10001, 0);
         if let Some(sync_optic) = self.fn_silfp_sync_optic {
@@ -1184,7 +1185,7 @@ impl FingerprintHal {
             return;
         }
 
-        // fake press: HBM on (kernel kirim uevent FULL_HBM_SET -> HAL Goodix capture) + arm
+        // fake press: HBM on + arm
         self.is_finger_down.store(true, Ordering::SeqCst);
         self.step_captured.store(false, Ordering::SeqCst);
         if !crate::hbm::set_hbm_sync(true, 500) {
@@ -1198,13 +1199,8 @@ impl FingerprintHal {
         std::thread::sleep(std::time::Duration::from_millis(5));
         self.send_custom_cmd(10, 1, 0x10001, 1);
         self.send_custom_cmd(11, 1, 0x10001, 1);
-        if let Some(sync_optic) = self.fn_silfp_sync_optic {
-            unsafe { sync_optic(1) };
-        } else if let Some(sync_down) = self.fn_silfp_sync_down {
-            unsafe { sync_down() };
-        } else if let Some(msg_send) = self.fn_silfp_msg_send {
-            unsafe { msg_send(2) };
-        }
+        // fake press: KEY 0xC3 DOWN -> Goodix HAL mulai capture
+        crate::input::inject_fod_key(1);
     }
 
     pub fn is_finger_held(&self) -> bool {
@@ -1287,7 +1283,7 @@ impl FingerprintHal {
                     1001 | 1002 | 1020 => {
                         // Suppress Silead internal hardware signals from framework logcat
                         // (1001 = down, 1002 = up, 1020 = wait ui ready)
-                        log_debug!("Silead internal acquired event: {}", acq_data.acquired_info);
+                        log_debug!("Vendor internal acquired event: {}", acq_data.acquired_info);
                         return;
                     }
                     other => (AcquiredInfo::VENDOR, other),
