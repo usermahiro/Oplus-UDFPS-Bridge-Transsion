@@ -259,16 +259,19 @@ Pipeline: `cargo build` (aarch64-linux-android) -> patch `libgf_hal.so` -> verif
 
 ## 6. System Properties
 
-The following system properties configure optical sensor geometry, framework behavior, and UI animation modes. These properties can be placed in `/vendor/etc/special.prop` or system `build.prop` files:
+The HAL writes the two that decide *whether* the UI is an under-display one, and fills the geometry when the ROM left it empty:
+
+| prop | when set | why |
+|---|---|---|
+| `persist.vendor.fingerprint.sensor_type=optical` | every start, and again within 5 s if changed | SystemUI picks the under-display layout from it. It lives in `/data/property`, so **a format data wipes it** and the icon falls back to the rear fingerprint style while the sensor still works |
+| `vendor.fingerprint.aidl.support=1` | every start | AuthService treats this as a modern AIDL sensor |
+| `persist.vendor.fingerprint.optical.iconsize` / `iconlocation` / `sensorlocation` / `iconnumber` | only when empty | the panel's own numbers. A value already present wins: forcing `540::2172` onto a different panel would move the icon off the sensor |
+
+So no prop file and no `setprop` after flashing is required. The optional props below still work if you want to override the geometry or the animation level from the ROM:
 
 ```properties
-vendor.fingerprint.aidl.support=1
-persist.sys.block.fingerprint=false
-persist.vendor.fingerprint.optical.iconsize=200
-persist.vendor.fingerprint.optical.iconlocation=228
-persist.vendor.fingerprint.optical.sensorlocation=540::2172
-persist.vendor.fingerprint.optical.iconnumber=5
 persist.sys.oplus.anim_level=2
+persist.sys.block.fingerprint=false
 ```
 
 ---

@@ -6,6 +6,7 @@ pub mod hal;
 pub mod hbm;
 pub mod input;
 pub mod log;
+pub mod props;
 pub mod service;
 
 pub const SERVICE_NAME: &str = "android.hardware.biometrics.fingerprint.IFingerprint/default";

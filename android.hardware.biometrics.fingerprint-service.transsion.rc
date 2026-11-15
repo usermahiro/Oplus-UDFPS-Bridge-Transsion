@@ -13,6 +13,11 @@ on early-boot
 on post-fs-data
     setprop vendor.fingerprint.aidl.support 1
     setprop persist.sys.block.fingerprint false
+    # Lives in /data/property and is wiped by a format data. Without it SystemUI
+    # falls back to the rear fingerprint layout while the sensor keeps working,
+    # because this HAL's touch target is a constant. The HAL also enforces it at
+    # startup; this line covers the case where SELinux denies the HAL's write.
+    setprop persist.vendor.fingerprint.sensor_type optical
     mkdir /data/vendor_de/0/fpdata 0700 system system
     write /proc/fingerprint_status 1
     write /proc/gesture_function fp1

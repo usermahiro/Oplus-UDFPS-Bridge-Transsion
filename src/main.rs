@@ -8,16 +8,10 @@ use oplus_udfps_bridge_transsion::SERVICE_NAME;
 #[cfg(target_os = "android")]
 extern "C" {
     fn __system_property_get(name: *const libc::c_char, value: *mut libc::c_char) -> libc::c_int;
-    fn __system_property_set(name: *const libc::c_char, value: *const libc::c_char) -> libc::c_int;
 }
 
 #[cfg(not(target_os = "android"))]
 unsafe fn __system_property_get(_name: *const libc::c_char, _value: *mut libc::c_char) -> libc::c_int {
-    0
-}
-
-#[cfg(not(target_os = "android"))]
-unsafe fn __system_property_set(_name: *const libc::c_char, _value: *const libc::c_char) -> libc::c_int {
     0
 }
 
@@ -33,22 +27,17 @@ fn get_system_prop(key: &[u8], default: &str) -> String {
     }
 }
 
-fn set_system_prop(key: &[u8], value: &[u8]) {
-    unsafe {
-        __system_property_set(
-            key.as_ptr() as *const libc::c_char,
-            value.as_ptr() as *const libc::c_char,
-        );
-    }
-}
-
 fn main() -> anyhow::Result<()> {
     unsafe {
         libc::signal(libc::SIGPIPE, libc::SIG_IGN);
     }
 
-    // Ensure ColorOS AuthService recognises this sensor as a modern AIDL sensor
-    set_system_prop(b"vendor.fingerprint.aidl.support\0", b"1\0");
+    // The props ColorOS needs to treat this as an under-display sensor, before
+    // SystemUI reads them. They are the reason this source no longer needs a
+    // prop file: the values live in /data/property, a format data wipes them,
+    // and nothing in the ported ROM puts them back.
+    oplus_udfps_bridge_transsion::props::enforce();
+    oplus_udfps_bridge_transsion::props::spawn_guard();
 
     // Ensure gesture FOD is enabled in kernel driver
     oplus_udfps_bridge_transsion::input::ensure_gesture_fod_enabled();
