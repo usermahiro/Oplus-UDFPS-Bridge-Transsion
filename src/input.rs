@@ -849,7 +849,7 @@ pub fn start_screen_off_touch_monitor(hal: Arc<crate::hal::FingerprintHal>) {
                             }
                             if !hal.is_active() {
                                 log_info!("SOFOD fake: framework session not active after {}ms -> starting authenticate", waited);
-                                hal.authenticate(0);
+                                hal.start_auto_authenticate();
                             }
                             acquire_wakelock("oplus_udfps_fod_wake");
                             log_info!("SOFOD fake: display on, finger still held at ({}, {}) -> auto capture", px, py);

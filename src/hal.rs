@@ -19,6 +19,9 @@ const HOLD_ENROLL_REARM_MS: u64 = 450;
 const HOLD_AUTH_REARM_MS: u64 = 350;
 /// Maks retry auth otomatis per sentuhan (Android lockout setelah 5 gagal)
 const HOLD_AUTH_REARM_MAX: u32 = 3;
+/// Sesi authenticate yang dimulai HAL sendiri (SOFOD) dianggap basi setelah selama ini
+/// kalau layar sudah ON; di bawah itu masih alur wake SOFOD yang sedang dilayani.
+const AUTO_SESSION_GRACE_MS: u128 = 2000;
 /// Lama "jari terangkat" palsu antara HBM off dan on
 const HOLD_FAKE_UP_MS: u64 = 80;
 
@@ -259,6 +262,10 @@ pub struct FingerprintHal {
     is_goodix: bool,
     current_callback: Arc<Mutex<Option<Strong<dyn ISessionCallback>>>>,
     is_active: AtomicBool,
+    /// true when the current session was started by this HAL itself (SOFOD auto-start),
+    /// not by the framework. The framework does not know about it and never cancels it.
+    auto_session: AtomicBool,
+    auto_session_at: Mutex<Option<std::time::Instant>>,
     is_finger_down: AtomicBool,
     current_user_id: std::sync::atomic::AtomicI32,
     enumerated_ids: Mutex<Vec<i32>>,
@@ -581,6 +588,8 @@ impl FingerprintHal {
             is_goodix,
             current_callback: Arc::new(Mutex::new(None)),
             is_active: AtomicBool::new(false),
+            auto_session: AtomicBool::new(false),
+            auto_session_at: Mutex::new(None),
             is_finger_down: AtomicBool::new(false),
             current_user_id: std::sync::atomic::AtomicI32::new(0),
             enumerated_ids: Mutex::new(Vec::new()),
@@ -780,6 +789,7 @@ impl FingerprintHal {
     }
 
     pub fn enroll(&self, hat: &hw_auth_token_t, timeout_sec: u32) -> i32 {
+        self.auto_session.store(false, Ordering::SeqCst);
         self.step_captured.store(false, Ordering::SeqCst);
         self.saved_enroll_fid.store(0, Ordering::SeqCst);
         log_info!("FingerprintHal::enroll invoked");
@@ -812,7 +822,39 @@ impl FingerprintHal {
         }
     }
 
+    /// SOFOD: the screen is off/doze and nobody started a session. Start one ourselves
+    /// and remember that, so it can be torn down again if it ends up unused.
+    pub fn start_auto_authenticate(&self) -> i32 {
+        let ret = self.authenticate(0);
+        *self.auto_session_at.lock() = Some(std::time::Instant::now());
+        self.auto_session.store(true, Ordering::SeqCst);
+        ret
+    }
+
+    /// True when a HAL-started session exists and is older than `min_age_ms`.
+    /// A young one is the SOFOD wake flow that is still being served right now.
+    fn auto_session_stale(&self, min_age_ms: u128) -> bool {
+        self.auto_session.load(Ordering::SeqCst)
+            && self
+                .auto_session_at
+                .lock()
+                .map_or(true, |t| t.elapsed().as_millis() >= min_age_ms)
+    }
+
+    /// Tear down a session that this HAL started itself. No-op for framework sessions
+    /// and for auto sessions younger than `min_age_ms`.
+    pub fn end_auto_session(&self, why: &str, min_age_ms: u128) {
+        if !self.auto_session_stale(min_age_ms) {
+            return;
+        }
+        if self.auto_session.swap(false, Ordering::SeqCst) {
+            log_info!("Ending HAL-started auto session ({})", why);
+            self.cancel();
+        }
+    }
+
     pub fn authenticate(&self, operation_id: u64) -> i32 {
+        self.auto_session.store(false, Ordering::SeqCst);
         if self.is_goodix {
             let dev = unsafe { &mut *(self.device as *mut goodix_fingerprint_device_t) };
             if let Some(auth_fn) = dev.authenticate {
@@ -857,6 +899,7 @@ impl FingerprintHal {
         // Ensure HBM is deactivated and finger state reset when entering screen OFF
         if state == 0 {
             crate::hbm::set_hbm(false);
+            crate::refresh::release();
             self.is_finger_down.store(false, Ordering::SeqCst);
         }
 
@@ -875,6 +918,7 @@ impl FingerprintHal {
             1 => {
                 // State 1: Awake (Screen ON)
                 log_info!("[SleepState: AWAKE] Screen is ON / active.");
+                self.end_auto_session("screen turned ON", AUTO_SESSION_GRACE_MS);
                 self.send_custom_cmd(10, 1, 0x10001, 1);
             }
             _ => {
@@ -913,6 +957,7 @@ impl FingerprintHal {
         self.step_captured.store(false, Ordering::SeqCst);
         crate::hbm::set_hbm(false);
         if _was_down {
+            crate::refresh::release();
             self.notify_framework_touch(false);
         }
         self.send_custom_cmd(10, 0, 0x10001, 0);
@@ -936,6 +981,7 @@ impl FingerprintHal {
             }
         }
         self.is_active.store(false, Ordering::SeqCst);
+                self.auto_session.store(false, Ordering::SeqCst);
     }
 
     pub fn enumerate(&self) {
@@ -1027,13 +1073,22 @@ impl FingerprintHal {
 
         let screen_state = self.get_screen_state();
 
+        // Guard: a session that this HAL started itself (SOFOD) is only valid while the
+        // screen is off/doze. Once the screen is ON the framework owns FOD: a leftover
+        // auto session must not light HBM when the sensor area is touched in an app.
+        if self.is_active() && screen_state == 1 && self.auto_session_stale(AUTO_SESSION_GRACE_MS) {
+            log_info!("on_pointer_down ignored: stale HAL-started session while screen is ON");
+            self.end_auto_session("screen is ON", AUTO_SESSION_GRACE_MS);
+            return;
+        }
+
         if !self.is_active() {
             if screen_state == 1 {
                 log_debug!("on_pointer_down while inactive and screen is ON -> ignored");
                 return;
             }
             log_info!("on_pointer_down while inactive (screen_state={}) -> auto-starting authenticate for SOFOD", screen_state);
-            self.authenticate(0);
+            self.start_auto_authenticate();
         }
 
         self.finger_held.store(true, Ordering::SeqCst);
@@ -1047,6 +1102,13 @@ impl FingerprintHal {
             "on_pointer_down at ({}, {}) (screen_state={}) -> activating HBM & optical capture",
             x, y, screen_state
         );
+
+        // Lock the panel to 120Hz while the finger is on the FOD (async, never blocks).
+        // Guard: only with an active auth/enroll session, so a stray touch on the
+        // sensor area while FOD is not in use never touches the refresh rate.
+        if self.is_active() {
+            crate::refresh::lock_high();
+        }
 
         // 1. Notify framework touch start (standard AIDL AcquiredInfo::START)
         if let Some(cb) = self.current_callback.lock().as_ref() {
@@ -1113,6 +1175,9 @@ impl FingerprintHal {
 
         // Always guarantee HBM is turned off immediately on pointer up
         crate::hbm::set_hbm(false);
+
+        // Restore the original refresh rate 4s after finger up
+        crate::refresh::release();
 
         // Inform vendor sensor of finger lift
         self.send_custom_cmd(11, 0, 0x10001, 0);
@@ -1186,6 +1251,7 @@ impl FingerprintHal {
         }
 
         // fake press: HBM on + arm
+        crate::refresh::keep_alive();
         self.is_finger_down.store(true, Ordering::SeqCst);
         self.step_captured.store(false, Ordering::SeqCst);
         if !crate::hbm::set_hbm_sync(true, 500) {
@@ -1250,6 +1316,7 @@ impl FingerprintHal {
 
                 if fid != 0 {
                     self.is_active.store(false, Ordering::SeqCst);
+                self.auto_session.store(false, Ordering::SeqCst);
                     self.send_custom_cmd(10, 0, 0x10001, 0);
                     self.rearm_gen.fetch_add(1, Ordering::SeqCst);
                     log_info!("Authentication SUCCEEDED for fid {}", fid);
@@ -1349,6 +1416,7 @@ impl FingerprintHal {
                 if raw_remaining == 0 {
                     log_info!("Enrollment completed successfully (final fid {})", fid);
                     self.is_active.store(false, Ordering::SeqCst);
+                self.auto_session.store(false, Ordering::SeqCst);
                     self.send_custom_cmd(10, 0, 0x10001, 0);
                 }
             }
@@ -1396,6 +1464,7 @@ impl FingerprintHal {
                 self.is_finger_down.store(false, Ordering::SeqCst);
                 crate::hbm::set_hbm(false);
                 self.is_active.store(false, Ordering::SeqCst);
+                self.auto_session.store(false, Ordering::SeqCst);
                 self.send_custom_cmd(10, 0, 0x10001, 0);
                 self.send_custom_cmd(11, 0, 0x10001, 0);
 
