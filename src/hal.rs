@@ -14,7 +14,7 @@ use crate::android::hardware::keymaster::Timestamp::Timestamp;
 use crate::{log_debug, log_info, log_warn};
 
 /// Jeda setelah sample enroll sebelum capture berikutnya (biar animasi progress sempat jalan)
-const HOLD_ENROLL_REARM_MS: u64 = 450;
+
 /// Jeda sebelum retry auth saat jari masih menempel
 const HOLD_AUTH_REARM_MS: u64 = 350;
 /// Maks retry auth otomatis per sentuhan (Android lockout setelah 5 gagal)
@@ -1428,12 +1428,8 @@ impl FingerprintHal {
 
                 log_info!("Reporting enrollment progress: fid {}, remaining {}", fid, raw_remaining);
                 let _ = cb.onEnrollmentProgress(fid, raw_remaining);
-                if raw_remaining > 0 {
-                    // Jari masih ditekan -> lanjut sample berikutnya otomatis (spam enroll)
-                    self.schedule_hold_rearm(HOLD_ENROLL_REARM_MS);
-                } else {
-                    self.rearm_gen.fetch_add(1, Ordering::SeqCst);
-                }
+                // Cancel any pending rearm; next sample requires a fresh touch.
+                self.rearm_gen.fetch_add(1, Ordering::SeqCst);
 
                 if raw_remaining == 0 {
                     log_info!("Enrollment completed successfully (final fid {})", fid);

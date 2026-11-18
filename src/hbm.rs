@@ -31,7 +31,10 @@ fn read_tran() -> Option<i32> {
     match t {
         "0" => Some(0),
         "1" => Some(1),
-        _ => t.parse::<i32>().ok(),
+        _ => t.parse::<i32>().ok().or_else(|| {
+            let digits = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")).unwrap_or(t);
+            i32::from_str_radix(digits, 16).ok()
+        }),
     }
 }
 
