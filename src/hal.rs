@@ -624,7 +624,28 @@ impl FingerprintHal {
 
         let _ = GLOBAL_HAL.set(hal.clone());
         crate::input::start_screen_off_touch_monitor(hal.clone());
+        Self::start_hbm_idle_guard(hal.clone());
         Ok(hal)
+    }
+
+    /// Last-resort guard for the "HBM stays lit" bug: enrolment/authentication end
+    /// through many paths (session close, framework cancel, vendor error, duplicate
+    /// vendor events), so one periodic check guarantees the panel is turned off even
+    /// when a path misses its own cleanup.
+    fn start_hbm_idle_guard(hal: Arc<Self>) {
+        const INTERVAL_MS: u64 = 1_500;
+        let spawned = std::thread::Builder::new()
+            .name("fod_hbm_guard".to_string())
+            .spawn(move || loop {
+                std::thread::sleep(std::time::Duration::from_millis(INTERVAL_MS));
+                if crate::hbm::is_enabled() && !hal.is_active() && !hal.is_finger_down() {
+                    log_warn!("HBM was on with no active session/finger -> forcing it off");
+                    crate::hbm::set_hbm(false);
+                }
+            });
+        if let Err(e) = spawned {
+            log_warn!("HBM idle guard: failed to spawn thread: {e}");
+        }
     }
 
     pub fn is_active(&self) -> bool {
@@ -773,6 +794,11 @@ impl FingerprintHal {
     }
 
     pub fn post_enroll(&self, challenge: u64) {
+        // Enrolment is finished from the framework's point of view: whatever the last
+        // touch left behind must not keep the panel boosted.
+        crate::hbm::set_hbm(false);
+        self.is_finger_down.store(false, Ordering::SeqCst);
+        self.finger_held.store(false, Ordering::SeqCst);
         if self.is_goodix {
             let dev = unsafe { &mut *(self.device as *mut goodix_fingerprint_device_t) };
             if let Some(post_enroll_fn) = dev.post_enroll {
@@ -792,6 +818,9 @@ impl FingerprintHal {
         self.auto_session.store(false, Ordering::SeqCst);
         self.step_captured.store(false, Ordering::SeqCst);
         self.saved_enroll_fid.store(0, Ordering::SeqCst);
+        // A new operation must never inherit a lit panel from the previous one.
+        crate::hbm::set_hbm(false);
+        self.is_finger_down.store(false, Ordering::SeqCst);
         log_info!("FingerprintHal::enroll invoked");
 
         if let Some(msg_send) = self.fn_silfp_msg_send {
@@ -855,6 +884,8 @@ impl FingerprintHal {
 
     pub fn authenticate(&self, operation_id: u64) -> i32 {
         self.auto_session.store(false, Ordering::SeqCst);
+        // A new operation must never inherit a lit panel from the previous one.
+        crate::hbm::set_hbm(false);
         if self.is_goodix {
             let dev = unsafe { &mut *(self.device as *mut goodix_fingerprint_device_t) };
             if let Some(auth_fn) = dev.authenticate {
@@ -899,7 +930,6 @@ impl FingerprintHal {
         // Ensure HBM is deactivated and finger state reset when entering screen OFF
         if state == 0 {
             crate::hbm::set_hbm(false);
-            crate::refresh::release();
             self.is_finger_down.store(false, Ordering::SeqCst);
         }
 
@@ -957,7 +987,6 @@ impl FingerprintHal {
         self.step_captured.store(false, Ordering::SeqCst);
         crate::hbm::set_hbm(false);
         if _was_down {
-            crate::refresh::release();
             self.notify_framework_touch(false);
         }
         self.send_custom_cmd(10, 0, 0x10001, 0);
@@ -1103,13 +1132,6 @@ impl FingerprintHal {
             x, y, screen_state
         );
 
-        // Lock the panel to 120Hz while the finger is on the FOD (async, never blocks).
-        // Guard: only with an active auth/enroll session, so a stray touch on the
-        // sensor area while FOD is not in use never touches the refresh rate.
-        if self.is_active() {
-            crate::refresh::lock_high();
-        }
-
         // 1. Notify framework touch start (standard AIDL AcquiredInfo::START)
         if let Some(cb) = self.current_callback.lock().as_ref() {
             let _ = cb.onAcquired(AcquiredInfo::START, 0);
@@ -1175,9 +1197,6 @@ impl FingerprintHal {
 
         // Always guarantee HBM is turned off immediately on pointer up
         crate::hbm::set_hbm(false);
-
-        // Restore the original refresh rate 4s after finger up
-        crate::refresh::release();
 
         // Inform vendor sensor of finger lift
         self.send_custom_cmd(11, 0, 0x10001, 0);
@@ -1251,7 +1270,6 @@ impl FingerprintHal {
         }
 
         // fake press: HBM on + arm
-        crate::refresh::keep_alive();
         self.is_finger_down.store(true, Ordering::SeqCst);
         self.step_captured.store(false, Ordering::SeqCst);
         if !crate::hbm::set_hbm_sync(true, 500) {
@@ -1369,6 +1387,10 @@ impl FingerprintHal {
                 };
 
                 if !self.is_goodix && self.step_captured.swap(true, Ordering::SeqCst) {
+                    // Duplicate sample for the same touch: the panel was already boosted
+                    // by the first one, so it still has to go off before we bail out.
+                    crate::hbm::set_hbm(false);
+                    self.is_finger_down.store(false, Ordering::SeqCst);
                     log_debug!("Duplicate enroll step during same touch ignored (raw_remaining={})", raw_remaining);
                     return;
                 }
